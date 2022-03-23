@@ -257,10 +257,10 @@ class _MyAppState extends State<MyApp> {
   }) async {
     await new Future.delayed(new Duration(milliseconds: 100));
     ScaffoldMessenger.of(context).showSnackBar(
-      new SnackBar(
-        content: new Text(
+      SnackBar(
+        content: Text(
           message,
-          style: new TextStyle(
+          style: TextStyle(
             color: Colors.white,
           ),
         ),

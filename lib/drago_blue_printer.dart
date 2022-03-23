@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 class DragoBluePrinter {
   static const int STATE_OFF = 10;
@@ -66,8 +67,27 @@ class DragoBluePrinter {
 
   ///getBondedDevices()
   Future<List<BluetoothDevice>> getBondedDevices() async {
-    final List list = await (_channel.invokeMethod('getBondedDevices'));
-    return list.map((map) => BluetoothDevice.fromMap(map)).toList();
+    bool hasAccess = false;
+    if (await Permission.bluetooth.isPermanentlyDenied) openAppSettings();
+    hasAccess = await Permission.bluetooth.isGranted;
+    if (!hasAccess) hasAccess = await Permission.bluetooth.request().isGranted;
+
+    if (await Permission.bluetoothScan.isPermanentlyDenied) openAppSettings();
+    hasAccess = await Permission.bluetoothScan.isGranted;
+    if (!hasAccess)
+      hasAccess = await Permission.bluetoothScan.request().isGranted;
+
+    if (await Permission.bluetoothConnect.isPermanentlyDenied)
+      openAppSettings();
+    hasAccess = await Permission.bluetoothConnect.isGranted;
+    if (!hasAccess)
+      hasAccess = await Permission.bluetoothConnect.request().isGranted;
+
+    if (hasAccess) {
+      final List list = await (_channel.invokeMethod('getBondedDevices'));
+      return list.map((map) => BluetoothDevice.fromMap(map)).toList();
+    } else
+      return [];
   }
 
   ///isDeviceConnected(BluetoothDevice device)

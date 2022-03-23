@@ -267,15 +267,15 @@ public class DragoBluePrinterPlugin implements FlutterPlugin, ActivityAware,Meth
       case "getBondedDevices":
         try {
 
-          if (ContextCompat.checkSelfPermission(activity,
-                  Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+          // if (ContextCompat.checkSelfPermission(activity,
+          //         Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
 
-            ActivityCompat.requestPermissions(activity,
-                    new String[] { Manifest.permission.ACCESS_COARSE_LOCATION }, REQUEST_COARSE_LOCATION_PERMISSIONS);
+          //   ActivityCompat.requestPermissions(activity,
+          //           new String[] { Manifest.permission.ACCESS_COARSE_LOCATION }, REQUEST_COARSE_LOCATION_PERMISSIONS);
 
-            pendingResult = result;
-            break;
-          }
+          //   pendingResult = result;
+          //   break;
+          // }
 
           getBondedDevices(result);
 
