@@ -1,10 +1,10 @@
 name: drago_blue_printer
 description: A Flutter plugin for connecting to thermal printer via bluetooth
-version: 0.0.2
+version: 0.0.3
 homepage: https://github.com/selvam920/drago_blue_printer
 
 environment:
-  sdk: '>=2.18.0-271.4.beta <3.0.0'
+  sdk: '>=2.19.2 <3.0.0'
   flutter: ">=1.20.0"
 
 dependencies:

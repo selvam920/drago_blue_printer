@@ -3,7 +3,7 @@ description: Demonstrates how to use the drago_blue_printer plugin.
 publish_to: https://pub.dev/packages/drago_blue_printer
 
 environment:
-  sdk: ">=2.1.0 <3.0.0"
+  sdk: '>=2.19.2 <3.0.0'
 
 dependencies:
   flutter:
