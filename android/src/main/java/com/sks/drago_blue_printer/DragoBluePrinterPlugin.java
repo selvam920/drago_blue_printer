@@ -50,11 +50,6 @@ import io.flutter.plugin.common.PluginRegistry;
 import io.flutter.plugin.common.PluginRegistry.Registrar;
 import io.flutter.plugin.common.PluginRegistry.RequestPermissionsResultListener;
 
-import com.google.zxing.BarcodeFormat;
-import com.google.zxing.MultiFormatWriter;
-import com.google.zxing.common.BitMatrix;
-import com.journeyapps.barcodescanner.BarcodeEncoder;
-
 public class DragoBluePrinterPlugin implements FlutterPlugin, ActivityAware,MethodCallHandler, RequestPermissionsResultListener {
 
   private static final String TAG = "BThermalPrinterPlugin";
@@ -351,18 +346,6 @@ public class DragoBluePrinterPlugin implements FlutterPlugin, ActivityAware,Meth
           printImageBytes(result, bytes);
         } else {
           result.error("invalid_argument", "argument 'bytes' not found", null);
-        }
-        break;
-
-      case "printQRcode":
-        if (arguments.containsKey("textToQR")) {
-          String textToQR = (String) arguments.get("textToQR");
-          int width = (int) arguments.get("width");
-          int height = (int) arguments.get("height");
-          int align = (int) arguments.get("align");
-          printQRcode(result, textToQR, width, height, align);
-        } else {
-          result.error("invalid_argument", "argument 'textToQR' not found", null);
         }
         break;
       case "printLeftRight":
@@ -879,44 +862,7 @@ public class DragoBluePrinterPlugin implements FlutterPlugin, ActivityAware,Meth
       Log.e(TAG, ex.getMessage(), ex);
       result.error("write_error", ex.getMessage(), exceptionToString(ex));
     }
-  }
-
-  private void printQRcode(Result result, String textToQR, int width, int height, int align) {
-    MultiFormatWriter multiFormatWriter = new MultiFormatWriter();
-    if (THREAD == null) {
-      result.error("write_error", "not connected", null);
-      return;
-    }
-    try {
-      switch (align) {
-        case 0:
-          // left align
-          THREAD.write(PrinterCommands.ESC_ALIGN_LEFT);
-          break;
-        case 1:
-          // center align
-          THREAD.write(PrinterCommands.ESC_ALIGN_CENTER);
-          break;
-        case 2:
-          // right align
-          THREAD.write(PrinterCommands.ESC_ALIGN_RIGHT);
-          break;
-      }
-      BitMatrix bitMatrix = multiFormatWriter.encode(textToQR, BarcodeFormat.QR_CODE, width, height);
-      BarcodeEncoder barcodeEncoder = new BarcodeEncoder();
-      Bitmap bmp = barcodeEncoder.createBitmap(bitMatrix);
-      if (bmp != null) {
-        byte[] command = Utils.decodeBitmap(bmp);
-        THREAD.write(command);
-      } else {
-        Log.e("Print Photo error", "the file isn't exists");
-      }
-      result.success(true);
-    } catch (Exception ex) {
-      Log.e(TAG, ex.getMessage(), ex);
-      result.error("write_error", ex.getMessage(), exceptionToString(ex));
-    }
-  }
+  } 
 
   private class ConnectedThread extends Thread {
     private final BluetoothSocket mmSocket;
