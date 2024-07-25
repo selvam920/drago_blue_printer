@@ -4,7 +4,42 @@
 # This file should be version controlled and should not be manually edited.
 
 version:
-  revision: 7a4c33425ddd78c54aba07d86f3f9a4a0051769b
-  channel: stable
+  revision: "b864805a681ae6bb7d7f6cafb7a5a21489819bcf"
+  channel: "beta"
 
 project_type: app
+
+# Tracks metadata for the flutter migrate command
+migration:
+  platforms:
+    - platform: root
+      create_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+      base_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+    - platform: android
+      create_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+      base_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+    - platform: ios
+      create_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+      base_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+    - platform: linux
+      create_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+      base_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+    - platform: macos
+      create_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+      base_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+    - platform: web
+      create_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+      base_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+    - platform: windows
+      create_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+      base_revision: b864805a681ae6bb7d7f6cafb7a5a21489819bcf
+
+  # User provided section
+
+  # List of Local paths (relative to this file) that should be
+  # ignored by the migrate tool.
+  #
+  # Files that are not part of the templates will be ignored by default.
+  unmanaged_files:
+    - 'lib/main.dart'
+    - 'ios/Runner.xcodeproj/project.pbxproj'

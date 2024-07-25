@@ -1,5 +1,5 @@
 import 'dart:io';
-import 'package:drago_blue_printer_example/testprint.dart';
+import 'package:example/testprint.dart';
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'package:drago_blue_printer/drago_blue_printer.dart';
@@ -163,7 +163,6 @@ class _MyAppState extends State<MyApp> {
                   mainAxisAlignment: MainAxisAlignment.end,
                   children: <Widget>[
                     ElevatedButton(
-                      style: ElevatedButton.styleFrom(primary: Colors.brown),
                       onPressed: () {
                         initPlatformState();
                       },
@@ -177,7 +176,8 @@ class _MyAppState extends State<MyApp> {
                     ),
                     ElevatedButton(
                       style: ElevatedButton.styleFrom(
-                          primary: _connected ? Colors.red : Colors.green),
+                          backgroundColor:
+                              _connected ? Colors.red : Colors.green),
                       onPressed: _connected ? _disconnect : _connect,
                       child: Text(
                         _connected ? 'Disconnect' : 'Connect',
@@ -190,7 +190,8 @@ class _MyAppState extends State<MyApp> {
                   padding:
                       const EdgeInsets.only(left: 10.0, right: 10.0, top: 50),
                   child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(primary: Colors.brown),
+                    style:
+                        ElevatedButton.styleFrom(backgroundColor: Colors.brown),
                     onPressed: () {
                       testPrint.sample(pathImage!);
                     },
@@ -252,7 +253,7 @@ class _MyAppState extends State<MyApp> {
 
   Future show(
     String message, {
-    Duration duration: const Duration(seconds: 3),
+    Duration duration = const Duration(seconds: 3),
   }) async {
     await new Future.delayed(new Duration(milliseconds: 100));
     ScaffoldMessenger.of(context).showSnackBar(
