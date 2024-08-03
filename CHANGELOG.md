@@ -11,3 +11,7 @@
 ## 0.0.5
 
 * Migrated to flutter >= 3.3.0
+
+## 0.0.6
+
+* Gradle upgrade to > 8.0
