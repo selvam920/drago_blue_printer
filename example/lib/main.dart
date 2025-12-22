@@ -11,14 +11,14 @@ class MyApp extends StatefulWidget {
   const MyApp({super.key});
 
   @override
-  _MyAppState createState() => _MyAppState();
+  State<MyApp> createState() => _MyAppState();
 }
 
 class _MyAppState extends State<MyApp> {
   DragoBluePrinter bluetooth = DragoBluePrinter.instance;
 
   List<BluetoothDevice> _devices = [];
-  List<BluetoothDevice> _scannedDevices = [];
+  final List<BluetoothDevice> _scannedDevices = [];
   BluetoothDevice? _device;
   bool _connected = false;
   String? pathImage;
@@ -48,7 +48,7 @@ class _MyAppState extends State<MyApp> {
     try {
       devices = await bluetooth.getBondedDevices();
     } catch (e) {
-      print("Error in initPlatformState: $e");
+      debugPrint("Error in initPlatformState: $e");
       // Optionally show a snackbar here
       // show("Error loading devices: $e");
     }
@@ -58,53 +58,53 @@ class _MyAppState extends State<MyApp> {
         case DragoBluePrinter.CONNECTED:
           setState(() {
             _connected = true;
-            print("bluetooth device state: connected");
+            debugPrint("bluetooth device state: connected");
           });
           break;
         case DragoBluePrinter.DISCONNECTED:
           setState(() {
             _connected = false;
-            print("bluetooth device state: disconnected");
+            debugPrint("bluetooth device state: disconnected");
           });
           break;
         case DragoBluePrinter.DISCONNECT_REQUESTED:
           setState(() {
             _connected = false;
-            print("bluetooth device state: disconnect requested");
+            debugPrint("bluetooth device state: disconnect requested");
           });
           break;
         case DragoBluePrinter.STATE_TURNING_OFF:
           setState(() {
             _connected = false;
-            print("bluetooth device state: bluetooth turning off");
+            debugPrint("bluetooth device state: bluetooth turning off");
           });
           break;
         case DragoBluePrinter.STATE_OFF:
           setState(() {
             _connected = false;
-            print("bluetooth device state: bluetooth off");
+            debugPrint("bluetooth device state: bluetooth off");
           });
           break;
         case DragoBluePrinter.STATE_ON:
           setState(() {
             _connected = false;
-            print("bluetooth device state: bluetooth on");
+            debugPrint("bluetooth device state: bluetooth on");
           });
           break;
         case DragoBluePrinter.STATE_TURNING_ON:
           setState(() {
             _connected = false;
-            print("bluetooth device state: bluetooth turning on");
+            debugPrint("bluetooth device state: bluetooth turning on");
           });
           break;
         case DragoBluePrinter.ERROR:
           setState(() {
             _connected = false;
-            print("bluetooth device state: error");
+            debugPrint("bluetooth device state: error");
           });
           break;
         default:
-          print(state);
+          debugPrint(state.toString());
           break;
       }
     });
@@ -161,7 +161,7 @@ class _MyAppState extends State<MyApp> {
       await Future.delayed(const Duration(seconds: 2));
       initPlatformState();
     } catch (e) {
-      print("Pairing error: $e");
+      debugPrint("Pairing error: $e");
       show("Pairing failed: $e", duration: const Duration(seconds: 5));
     }
   }
@@ -391,6 +391,7 @@ class _MyAppState extends State<MyApp> {
     Duration duration = const Duration(seconds: 3),
   }) async {
     await Future.delayed(const Duration(milliseconds: 100));
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(

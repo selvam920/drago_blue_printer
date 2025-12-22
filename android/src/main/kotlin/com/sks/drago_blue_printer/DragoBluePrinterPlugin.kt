@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Application
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothClass
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothSocket
@@ -358,13 +359,25 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
     private fun getBondedDevices(result: Result) {
         val list: MutableList<Map<String, Any>> = ArrayList()
         for (device in mBluetoothAdapter!!.bondedDevices) {
-            val ret: MutableMap<String, Any> = HashMap()
-            ret["address"] = device.address
-            ret["name"] = device.name
-            ret["type"] = device.type
-            list.add(ret)
+            if (isPrinter(device)) {
+                val ret: MutableMap<String, Any> = HashMap()
+                ret["address"] = device.address
+                ret["name"] = device.name
+                ret["type"] = device.type
+                list.add(ret)
+            }
         }
         result.success(list)
+    }
+
+    private fun isPrinter(device: BluetoothDevice): Boolean {
+        if (device.bluetoothClass != null) {
+            val majorDeviceClass = device.bluetoothClass.majorDeviceClass
+            if (majorDeviceClass == BluetoothClass.Device.Major.IMAGING || majorDeviceClass == BluetoothClass.Device.Major.UNCATEGORIZED) {
+                return true
+            }
+        }
+        return false
     }
 
     private fun isDeviceConnected(result: Result, address: String) {
@@ -880,7 +893,7 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
                 val action = intent.action
                 if (BluetoothDevice.ACTION_FOUND == action) {
                     val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
-                    if (device != null) {
+                    if (device != null && isPrinter(device)) {
                         val ret: MutableMap<String, Any> = HashMap()
                         ret["address"] = device.address
                         ret["name"] = device.name ?: "Unknown"

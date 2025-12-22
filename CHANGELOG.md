@@ -19,3 +19,7 @@
 ## 0.0.7
 
 * Migrated from java to kotlin
+
+## 0.0.8
+
+* Bluetooth printer only return

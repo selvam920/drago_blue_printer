@@ -1,0 +1,17 @@
+Analyzing example...                                            
+
+   info - Invalid use of a private type in a public API - lib\main.dart:14:3 - library_private_types_in_public_api
+   info - The private field _scannedDevices could be 'final' - lib\main.dart:21:25 - prefer_final_fields
+   info - Don't invoke 'print' in production code - lib\main.dart:51:7 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:61:13 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:67:13 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:73:13 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:79:13 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:85:13 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:91:13 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:97:13 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:103:13 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:107:11 - avoid_print
+   info - Don't invoke 'print' in production code - lib\main.dart:164:7 - avoid_print
+   info - Don't use 'BuildContext's across async gaps - lib\main.dart:394:26 - use_build_context_synchronously
+
