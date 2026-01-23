@@ -1,4 +1,4 @@
-#import <Flutter/Flutter.h>
+// #import <Flutter/Flutter.h>
 
-@interface DragoBluePrinterPlugin : NSObject<FlutterPlugin>
-@end
+// @interface DragoBluePrinterPlugin : NSObject<FlutterPlugin>
+// @end
