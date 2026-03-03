@@ -320,6 +320,15 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
                     result.error("invalid_argument", "argument 'address' not found", null)
                 }
             }
+            "printBatch" -> {
+                if (arguments != null && arguments.containsKey("commands")) {
+                    @Suppress("UNCHECKED_CAST")
+                    val commands = arguments["commands"] as List<Map<String, Any>>
+                    printBatch(result, commands)
+                } else {
+                    result.error("invalid_argument", "argument 'commands' not found", null)
+                }
+            }
             else -> result.notImplemented()
         }
     }
@@ -519,6 +528,7 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
         }
         try {
             THREAD!!.write(message.toByteArray())
+            THREAD!!.flush()
             result.success(true)
         } catch (ex: Exception) {
             Log.e(TAG, ex.message, ex)
@@ -532,7 +542,13 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
             return
         }
         try {
-            THREAD!!.write(message)
+            // Use chunked writes for large payloads (e.g. images)
+            if (message.size > 2048) {
+                THREAD!!.writeChunked(message)
+            } else {
+                THREAD!!.write(message)
+                THREAD!!.flush()
+            }
             result.success(true)
         } catch (ex: Exception) {
             Log.e(TAG, ex.message, ex)
@@ -553,26 +569,33 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
         }
 
         try {
-            when (size) {
-                0 -> THREAD!!.write(cc)
-                1 -> THREAD!!.write(bb)
-                2 -> THREAD!!.write(bb2)
-                3 -> THREAD!!.write(bb3)
-                4 -> THREAD!!.write(bb4)
+            // Build complete command as single byte array to minimize BT packets
+            val sizeCmd = when (size) {
+                0 -> cc; 1 -> bb; 2 -> bb2; 3 -> bb3; 4 -> bb4
+                else -> cc
             }
-
-            when (align) {
-                0 -> THREAD!!.write(PrinterCommands.ESC_ALIGN_LEFT)
-                1 -> THREAD!!.write(PrinterCommands.ESC_ALIGN_CENTER)
-                2 -> THREAD!!.write(PrinterCommands.ESC_ALIGN_RIGHT)
+            val alignCmd = when (align) {
+                0 -> PrinterCommands.ESC_ALIGN_LEFT
+                1 -> PrinterCommands.ESC_ALIGN_CENTER
+                2 -> PrinterCommands.ESC_ALIGN_RIGHT
+                else -> PrinterCommands.ESC_ALIGN_LEFT
             }
-
-            if (charset != null) {
-                THREAD!!.write(message.toByteArray(java.nio.charset.Charset.forName(charset)))
+            val msgBytes = if (charset != null) {
+                message.toByteArray(java.nio.charset.Charset.forName(charset))
             } else {
-                THREAD!!.write(message.toByteArray())
+                message.toByteArray()
             }
-            THREAD!!.write(PrinterCommands.FEED_LINE)
+
+            // Combine into single write: sizeCmd + alignCmd + message + newline
+            val combined = ByteArray(sizeCmd.size + alignCmd.size + msgBytes.size + PrinterCommands.FEED_LINE.size)
+            var offset = 0
+            System.arraycopy(sizeCmd, 0, combined, offset, sizeCmd.size); offset += sizeCmd.size
+            System.arraycopy(alignCmd, 0, combined, offset, alignCmd.size); offset += alignCmd.size
+            System.arraycopy(msgBytes, 0, combined, offset, msgBytes.size); offset += msgBytes.size
+            System.arraycopy(PrinterCommands.FEED_LINE, 0, combined, offset, PrinterCommands.FEED_LINE.size)
+
+            THREAD!!.write(combined)
+            THREAD!!.flush()
             result.success(true)
         } catch (ex: Exception) {
             Log.e(TAG, ex.message, ex)
@@ -592,23 +615,23 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
             return
         }
         try {
-            when (size) {
-                0 -> THREAD!!.write(cc)
-                1 -> THREAD!!.write(bb)
-                2 -> THREAD!!.write(bb2)
-                3 -> THREAD!!.write(bb3)
-                4 -> THREAD!!.write(bb4)
+            val sizeCmd = when (size) {
+                0 -> cc; 1 -> bb; 2 -> bb2; 3 -> bb3; 4 -> bb4; else -> cc
             }
-            THREAD!!.write(PrinterCommands.ESC_ALIGN_CENTER)
-            var line = String.format("%-15s %15s %n", msg1, msg2)
-            if (format != null) {
-                line = String.format(format, msg1, msg2)
-            }
-            if (charset != null) {
-                THREAD!!.write(line.toByteArray(java.nio.charset.Charset.forName(charset)))
-            } else {
-                THREAD!!.write(line.toByteArray())
-            }
+            var line = if (format != null) String.format(format, msg1, msg2)
+                       else String.format("%-15s %15s %n", msg1, msg2)
+            val msgBytes = if (charset != null) line.toByteArray(java.nio.charset.Charset.forName(charset))
+                           else line.toByteArray()
+
+            // Single combined write
+            val combined = ByteArray(sizeCmd.size + PrinterCommands.ESC_ALIGN_CENTER.size + msgBytes.size)
+            var offset = 0
+            System.arraycopy(sizeCmd, 0, combined, offset, sizeCmd.size); offset += sizeCmd.size
+            System.arraycopy(PrinterCommands.ESC_ALIGN_CENTER, 0, combined, offset, PrinterCommands.ESC_ALIGN_CENTER.size); offset += PrinterCommands.ESC_ALIGN_CENTER.size
+            System.arraycopy(msgBytes, 0, combined, offset, msgBytes.size)
+
+            THREAD!!.write(combined)
+            THREAD!!.flush()
             result.success(true)
         } catch (ex: Exception) {
             Log.e(TAG, ex.message, ex)
@@ -628,23 +651,22 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
             return
         }
         try {
-            when (size) {
-                0 -> THREAD!!.write(cc)
-                1 -> THREAD!!.write(bb)
-                2 -> THREAD!!.write(bb2)
-                3 -> THREAD!!.write(bb3)
-                4 -> THREAD!!.write(bb4)
+            val sizeCmd = when (size) {
+                0 -> cc; 1 -> bb; 2 -> bb2; 3 -> bb3; 4 -> bb4; else -> cc
             }
-            THREAD!!.write(PrinterCommands.ESC_ALIGN_CENTER)
-            var line = String.format("%-10s %10s %10s %n", msg1, msg2, msg3)
-            if (format != null) {
-                line = String.format(format, msg1, msg2, msg3)
-            }
-            if (charset != null) {
-                THREAD!!.write(line.toByteArray(java.nio.charset.Charset.forName(charset)))
-            } else {
-                THREAD!!.write(line.toByteArray())
-            }
+            var line = if (format != null) String.format(format, msg1, msg2, msg3)
+                       else String.format("%-10s %10s %10s %n", msg1, msg2, msg3)
+            val msgBytes = if (charset != null) line.toByteArray(java.nio.charset.Charset.forName(charset))
+                           else line.toByteArray()
+
+            val combined = ByteArray(sizeCmd.size + PrinterCommands.ESC_ALIGN_CENTER.size + msgBytes.size)
+            var offset = 0
+            System.arraycopy(sizeCmd, 0, combined, offset, sizeCmd.size); offset += sizeCmd.size
+            System.arraycopy(PrinterCommands.ESC_ALIGN_CENTER, 0, combined, offset, PrinterCommands.ESC_ALIGN_CENTER.size); offset += PrinterCommands.ESC_ALIGN_CENTER.size
+            System.arraycopy(msgBytes, 0, combined, offset, msgBytes.size)
+
+            THREAD!!.write(combined)
+            THREAD!!.flush()
             result.success(true)
         } catch (ex: Exception) {
             Log.e(TAG, ex.message, ex)
@@ -664,23 +686,22 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
             return
         }
         try {
-            when (size) {
-                0 -> THREAD!!.write(cc)
-                1 -> THREAD!!.write(bb)
-                2 -> THREAD!!.write(bb2)
-                3 -> THREAD!!.write(bb3)
-                4 -> THREAD!!.write(bb4)
+            val sizeCmd = when (size) {
+                0 -> cc; 1 -> bb; 2 -> bb2; 3 -> bb3; 4 -> bb4; else -> cc
             }
-            THREAD!!.write(PrinterCommands.ESC_ALIGN_CENTER)
-            var line = String.format("%-8s %7s %7s %7s %n", msg1, msg2, msg3, msg4)
-            if (format != null) {
-                line = String.format(format, msg1, msg2, msg3, msg4)
-            }
-            if (charset != null) {
-                THREAD!!.write(line.toByteArray(java.nio.charset.Charset.forName(charset)))
-            } else {
-                THREAD!!.write(line.toByteArray())
-            }
+            var line = if (format != null) String.format(format, msg1, msg2, msg3, msg4)
+                       else String.format("%-8s %7s %7s %7s %n", msg1, msg2, msg3, msg4)
+            val msgBytes = if (charset != null) line.toByteArray(java.nio.charset.Charset.forName(charset))
+                           else line.toByteArray()
+
+            val combined = ByteArray(sizeCmd.size + PrinterCommands.ESC_ALIGN_CENTER.size + msgBytes.size)
+            var offset = 0
+            System.arraycopy(sizeCmd, 0, combined, offset, sizeCmd.size); offset += sizeCmd.size
+            System.arraycopy(PrinterCommands.ESC_ALIGN_CENTER, 0, combined, offset, PrinterCommands.ESC_ALIGN_CENTER.size); offset += PrinterCommands.ESC_ALIGN_CENTER.size
+            System.arraycopy(msgBytes, 0, combined, offset, msgBytes.size)
+
+            THREAD!!.write(combined)
+            THREAD!!.flush()
             result.success(true)
         } catch (ex: Exception) {
             Log.e(TAG, ex.message, ex)
@@ -695,6 +716,7 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
         }
         try {
             THREAD!!.write(PrinterCommands.FEED_LINE)
+            THREAD!!.flush()
             result.success(true)
         } catch (ex: Exception) {
             Log.e(TAG, ex.message, ex)
@@ -709,6 +731,7 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
         }
         try {
             THREAD!!.write(PrinterCommands.FEED_PAPER_AND_CUT)
+            THREAD!!.flush()
             result.success(true)
         } catch (ex: Exception) {
             Log.e(TAG, ex.message, ex)
@@ -721,21 +744,26 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
             result.error("write_error", "not connected", null)
             return
         }
-        try {
-            val bmp = BitmapFactory.decodeFile(pathImage)
-            if (bmp != null) {
-                val command = Utils.decodeBitmap(bmp)
-                THREAD!!.write(PrinterCommands.ESC_ALIGN_CENTER)
-                if (command != null) {
-                    THREAD!!.write(command)
+        scope.launch {
+            try {
+                val bmp = BitmapFactory.decodeFile(pathImage)
+                if (bmp != null) {
+                    val command = Utils.decodeBitmap(bmp)
+                    if (command != null) {
+                        // Combine alignment + image data and use chunked write
+                        val combined = ByteArray(PrinterCommands.ESC_ALIGN_CENTER.size + command.size)
+                        System.arraycopy(PrinterCommands.ESC_ALIGN_CENTER, 0, combined, 0, PrinterCommands.ESC_ALIGN_CENTER.size)
+                        System.arraycopy(command, 0, combined, PrinterCommands.ESC_ALIGN_CENTER.size, command.size)
+                        THREAD!!.writeChunked(combined)
+                    }
+                } else {
+                    Log.e("Print Photo error", "the file doesn't exist")
                 }
-            } else {
-                Log.e("Print Photo error", "the file isn't exists")
+                result.success(true)
+            } catch (ex: Exception) {
+                Log.e(TAG, ex.message, ex)
+                result.error("write_error", ex.message, exceptionToString(ex))
             }
-            result.success(true)
-        } catch (ex: Exception) {
-            Log.e(TAG, ex.message, ex)
-            result.error("write_error", ex.message, exceptionToString(ex))
         }
     }
 
@@ -744,16 +772,139 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
             result.error("write_error", "not connected", null)
             return
         }
-        try {
-            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            if (bmp != null) {
-                val command = Utils.decodeBitmap(bmp)
-                THREAD!!.write(PrinterCommands.ESC_ALIGN_CENTER)
-                if (command != null) {
-                    THREAD!!.write(command)
+        scope.launch {
+            try {
+                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                if (bmp != null) {
+                    val command = Utils.decodeBitmap(bmp)
+                    if (command != null) {
+                        val combined = ByteArray(PrinterCommands.ESC_ALIGN_CENTER.size + command.size)
+                        System.arraycopy(PrinterCommands.ESC_ALIGN_CENTER, 0, combined, 0, PrinterCommands.ESC_ALIGN_CENTER.size)
+                        System.arraycopy(command, 0, combined, PrinterCommands.ESC_ALIGN_CENTER.size, command.size)
+                        THREAD!!.writeChunked(combined)
+                    }
+                } else {
+                    Log.e("Print Photo error", "the file doesn't exist")
                 }
+                result.success(true)
+            } catch (ex: Exception) {
+                Log.e(TAG, ex.message, ex)
+                result.error("write_error", ex.message, exceptionToString(ex))
+            }
+        }
+    }
+
+    /**
+     * Batch print: receives a list of commands, builds a single byte buffer,
+     * and sends it all in one go. This eliminates per-command Dart→Native round-trips
+     * and reduces the number of Bluetooth packets drastically.
+     *
+     * Each command map has a "type" key and type-specific parameters.
+     * Supported types: "custom", "leftRight", "3column", "4column", "newLine", "paperCut", "rawBytes"
+     */
+    private fun printBatch(result: Result, commands: List<Map<String, Any>>) {
+        if (THREAD == null) {
+            result.error("write_error", "not connected", null)
+            return
+        }
+
+        val cc = byteArrayOf(0x1B, 0x21, 0x03)
+        val bb = byteArrayOf(0x1B, 0x21, 0x08)
+        val bb2 = byteArrayOf(0x1B, 0x21, 0x20)
+        val bb3 = byteArrayOf(0x1B, 0x21, 0x10)
+        val bb4 = byteArrayOf(0x1B, 0x21, 0x30)
+
+        try {
+            val buffer = java.io.ByteArrayOutputStream(4096)
+
+            for (cmd in commands) {
+                val type = cmd["type"] as? String ?: continue
+
+                fun sizeCmd(size: Int): ByteArray = when (size) {
+                    0 -> cc; 1 -> bb; 2 -> bb2; 3 -> bb3; 4 -> bb4; else -> cc
+                }
+
+                fun alignCmd(align: Int): ByteArray = when (align) {
+                    0 -> PrinterCommands.ESC_ALIGN_LEFT
+                    1 -> PrinterCommands.ESC_ALIGN_CENTER
+                    2 -> PrinterCommands.ESC_ALIGN_RIGHT
+                    else -> PrinterCommands.ESC_ALIGN_LEFT
+                }
+
+                fun encodeMsg(message: String, charset: String?): ByteArray {
+                    return if (charset != null) message.toByteArray(java.nio.charset.Charset.forName(charset))
+                    else message.toByteArray()
+                }
+
+                when (type) {
+                    "custom" -> {
+                        val message = cmd["message"] as? String ?: continue
+                        val size = (cmd["size"] as? Int) ?: 0
+                        val align = (cmd["align"] as? Int) ?: 0
+                        val charset = cmd["charset"] as? String
+                        buffer.write(sizeCmd(size))
+                        buffer.write(alignCmd(align))
+                        buffer.write(encodeMsg(message, charset))
+                        buffer.write(PrinterCommands.FEED_LINE)
+                    }
+                    "leftRight" -> {
+                        val s1 = cmd["string1"] as? String ?: continue
+                        val s2 = cmd["string2"] as? String ?: continue
+                        val size = (cmd["size"] as? Int) ?: 0
+                        val charset = cmd["charset"] as? String
+                        val format = cmd["format"] as? String
+                        val line = if (format != null) String.format(format, s1, s2)
+                                   else String.format("%-15s %15s %n", s1, s2)
+                        buffer.write(sizeCmd(size))
+                        buffer.write(PrinterCommands.ESC_ALIGN_CENTER)
+                        buffer.write(encodeMsg(line, charset))
+                    }
+                    "3column" -> {
+                        val s1 = cmd["string1"] as? String ?: continue
+                        val s2 = cmd["string2"] as? String ?: continue
+                        val s3 = cmd["string3"] as? String ?: continue
+                        val size = (cmd["size"] as? Int) ?: 0
+                        val charset = cmd["charset"] as? String
+                        val format = cmd["format"] as? String
+                        val line = if (format != null) String.format(format, s1, s2, s3)
+                                   else String.format("%-10s %10s %10s %n", s1, s2, s3)
+                        buffer.write(sizeCmd(size))
+                        buffer.write(PrinterCommands.ESC_ALIGN_CENTER)
+                        buffer.write(encodeMsg(line, charset))
+                    }
+                    "4column" -> {
+                        val s1 = cmd["string1"] as? String ?: continue
+                        val s2 = cmd["string2"] as? String ?: continue
+                        val s3 = cmd["string3"] as? String ?: continue
+                        val s4 = cmd["string4"] as? String ?: continue
+                        val size = (cmd["size"] as? Int) ?: 0
+                        val charset = cmd["charset"] as? String
+                        val format = cmd["format"] as? String
+                        val line = if (format != null) String.format(format, s1, s2, s3, s4)
+                                   else String.format("%-8s %7s %7s %7s %n", s1, s2, s3, s4)
+                        buffer.write(sizeCmd(size))
+                        buffer.write(PrinterCommands.ESC_ALIGN_CENTER)
+                        buffer.write(encodeMsg(line, charset))
+                    }
+                    "newLine" -> {
+                        buffer.write(PrinterCommands.FEED_LINE)
+                    }
+                    "paperCut" -> {
+                        buffer.write(PrinterCommands.FEED_PAPER_AND_CUT)
+                    }
+                    "rawBytes" -> {
+                        val bytes = cmd["bytes"] as? ByteArray
+                        if (bytes != null) buffer.write(bytes)
+                    }
+                }
+            }
+
+            val allBytes = buffer.toByteArray()
+            if (allBytes.size > 2048) {
+                THREAD!!.writeChunked(allBytes)
             } else {
-                Log.e("Print Photo error", "the file isn't exists")
+                THREAD!!.write(allBytes)
+                THREAD!!.flush()
             }
             result.success(true)
         } catch (ex: Exception) {
@@ -766,6 +917,11 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
     private inner class ConnectedThread(private val mmSocket: BluetoothSocket) : Thread() {
         private val inputStream: InputStream?
         private val outputStream: OutputStream?
+        private val bufferedOutputStream: BufferedOutputStream?
+
+        // Optimal chunk size for Bluetooth Classic SPP (Serial Port Profile).
+        // Most BT adapters have a ~4KB buffer; writing in chunks prevents overflow.
+        private val CHUNK_SIZE = 2048
 
         init {
             var tmpIn: InputStream? = null
@@ -779,6 +935,7 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
             }
             inputStream = tmpIn
             outputStream = tmpOut
+            bufferedOutputStream = if (tmpOut != null) BufferedOutputStream(tmpOut, 4096) else null
         }
 
         override fun run() {
@@ -799,9 +956,48 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
             }
         }
 
+        /**
+         * Write bytes to the buffered output stream without flushing.
+         * Use [flush] after a complete command sequence for best performance.
+         */
         fun write(bytes: ByteArray) {
             try {
-                outputStream!!.write(bytes)
+                bufferedOutputStream!!.write(bytes)
+            } catch (e: IOException) {
+                e.printStackTrace()
+            }
+        }
+
+        /**
+         * Write bytes in chunks and flush — ideal for large data like images.
+         * Prevents Bluetooth buffer overflow on large payloads.
+         */
+        fun writeChunked(bytes: ByteArray) {
+            try {
+                var offset = 0
+                while (offset < bytes.size) {
+                    val length = minOf(CHUNK_SIZE, bytes.size - offset)
+                    bufferedOutputStream!!.write(bytes, offset, length)
+                    bufferedOutputStream.flush()
+                    offset += length
+                    // Small delay between chunks to let the printer's buffer drain
+                    if (offset < bytes.size) {
+                        Thread.sleep(5)
+                    }
+                }
+            } catch (e: IOException) {
+                e.printStackTrace()
+            } catch (e: InterruptedException) {
+                e.printStackTrace()
+            }
+        }
+
+        /**
+         * Flush the buffered output stream, sending all pending bytes.
+         */
+        fun flush() {
+            try {
+                bufferedOutputStream?.flush()
             } catch (e: IOException) {
                 e.printStackTrace()
             }
@@ -809,8 +1005,8 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
 
         fun cancel() {
             try {
-                outputStream?.flush()
-                outputStream?.close()
+                bufferedOutputStream?.flush()
+                bufferedOutputStream?.close()
                 inputStream?.close()
                 mmSocket.close()
             } catch (e: IOException) {

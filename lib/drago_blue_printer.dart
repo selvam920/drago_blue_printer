@@ -2,6 +2,77 @@ import 'dart:async';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+/// Command object for batch printing. Build a list of these and pass to
+/// [DragoBluePrinter.printBatch] to send all commands in a single BT packet.
+class PrintCommand {
+  final Map<String, dynamic> _data;
+  PrintCommand._(this._data);
+
+  Map<String, dynamic> toMap() => _data;
+
+  /// Custom text line
+  factory PrintCommand.custom(String message, int size, int align,
+          {String? charset}) =>
+      PrintCommand._({
+        'type': 'custom',
+        'message': message,
+        'size': size,
+        'align': align,
+        'charset': charset,
+      });
+
+  /// Two-column left/right text
+  factory PrintCommand.leftRight(String left, String right, int size,
+          {String? charset, String? format}) =>
+      PrintCommand._({
+        'type': 'leftRight',
+        'string1': left,
+        'string2': right,
+        'size': size,
+        'charset': charset,
+        'format': format,
+      });
+
+  /// Three-column text
+  factory PrintCommand.threeColumn(
+          String s1, String s2, String s3, int size,
+          {String? charset, String? format}) =>
+      PrintCommand._({
+        'type': '3column',
+        'string1': s1,
+        'string2': s2,
+        'string3': s3,
+        'size': size,
+        'charset': charset,
+        'format': format,
+      });
+
+  /// Four-column text
+  factory PrintCommand.fourColumn(
+          String s1, String s2, String s3, String s4, int size,
+          {String? charset, String? format}) =>
+      PrintCommand._({
+        'type': '4column',
+        'string1': s1,
+        'string2': s2,
+        'string3': s3,
+        'string4': s4,
+        'size': size,
+        'charset': charset,
+        'format': format,
+      });
+
+  /// New line feed
+  factory PrintCommand.newLine() => PrintCommand._({'type': 'newLine'});
+
+  /// Paper cut
+  factory PrintCommand.paperCut() => PrintCommand._({'type': 'paperCut'});
+
+  /// Raw ESC/POS bytes
+  factory PrintCommand.rawBytes(Uint8List bytes) =>
+      PrintCommand._({'type': 'rawBytes', 'bytes': bytes});
+}
+
 class DragoBluePrinter {
   static const int STATE_OFF = 10;
   static const int STATE_TURNING_ON = 11;
@@ -204,6 +275,30 @@ class DragoBluePrinter {
         'size': size,
         'charset': charset,
         'format': format
+      });
+
+  /// Send multiple print commands in a **single** method channel call.
+  ///
+  /// This is dramatically faster than calling individual print methods because:
+  /// - Only 1 Dart→Native round-trip instead of N
+  /// - All commands are merged into a single byte buffer on the native side
+  /// - The buffer is sent over Bluetooth in optimally-sized chunks
+  ///
+  /// Example:
+  /// ```dart
+  /// await printer.printBatch([
+  ///   PrintCommand.custom('RECEIPT', 3, 1),
+  ///   PrintCommand.newLine(),
+  ///   PrintCommand.leftRight('Item', 'Price', 1),
+  ///   PrintCommand.leftRight('Coffee', '\$3.50', 0),
+  ///   PrintCommand.newLine(),
+  ///   PrintCommand.custom('Thank you!', 0, 1),
+  ///   PrintCommand.paperCut(),
+  /// ]);
+  /// ```
+  Future<dynamic> printBatch(List<PrintCommand> commands) =>
+      _channel.invokeMethod('printBatch', {
+        'commands': commands.map((c) => c.toMap()).toList(),
       });
 }
 
