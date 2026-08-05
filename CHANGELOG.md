@@ -1,3 +1,6 @@
+## 1.0.1
+* update permission_handler v13.0.0
+
 ## 0.0.9
 
 * Renamed iOS plugin files from BlueThermalPrinter to DragoBluePrinter
