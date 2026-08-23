@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'package:example/testprint.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:drago_blue_printer/drago_blue_printer.dart';
 
 void main() => runApp(const MyApp());
