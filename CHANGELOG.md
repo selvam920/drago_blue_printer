@@ -1,5 +1,11 @@
+## 1.0.2
+* Upgrade android AGP
+
 ## 1.0.1
 * update permission_handler v13.0.0
+
+## 1.0.0
+-- added batch printing
 
 ## 0.0.9
 
@@ -31,6 +37,3 @@
 ## 0.0.1
 
 * initial release.
-
-## 1.0.0
--- added batch printing
