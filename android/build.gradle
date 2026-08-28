@@ -13,9 +13,7 @@ rootProject.allprojects {
 }
 
 android {
-    if (project.android.hasProperty("namespace")) {
-        namespace = "com.sks.drago_blue_printer"
-    }
+    namespace = "com.sks.drago_blue_printer"
 
     compileSdk = 37
 
