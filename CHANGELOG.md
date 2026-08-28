@@ -1,4 +1,7 @@
 ## 1.0.2
+* Fix android AGP
+
+## 1.0.2
 * Upgrade android AGP
 
 ## 1.0.1

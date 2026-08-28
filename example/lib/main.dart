@@ -251,7 +251,6 @@ class _BluetoothPrinterPageState extends State<BluetoothPrinterPage>
   // =========================================================================
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
     final isConnected =
         _selectedDevice != null && _connected && !_isConnecting;
 
