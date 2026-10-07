@@ -42,6 +42,8 @@ dependencies:
   cupertino_icons: ^1.0.8
 
   material_ui: any
+  barcode: any
+  image: any
 dev_dependencies:
   flutter_test:
     sdk: flutter

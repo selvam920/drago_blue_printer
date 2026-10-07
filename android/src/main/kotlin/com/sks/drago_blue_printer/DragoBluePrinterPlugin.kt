@@ -3,7 +3,6 @@ package com.sks.drago_blue_printer
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.app.Application
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothClass
 import android.bluetooth.BluetoothDevice
@@ -15,15 +14,14 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
-import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.EventChannel.EventSink
 import io.flutter.plugin.common.EventChannel.StreamHandler
@@ -31,472 +29,388 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
-import io.flutter.plugin.common.PluginRegistry
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.*
 import java.util.*
-import kotlin.collections.ArrayList
-import kotlin.collections.HashMap
-import kotlinx.coroutines.cancel
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
-class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, PluginRegistry.RequestPermissionsResultListener {
+class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
 
     companion object {
         private const val TAG = "BThermalPrinterPlugin"
         private const val NAMESPACE = "drago_blue_printer"
-        private const val REQUEST_COARSE_LOCATION_PERMISSIONS = 1451
         private val MY_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+
+        // Shared across engines; always read/written under [threadLock].
+        private val threadLock = Any()
         private var THREAD: ConnectedThread? = null
+
+        private fun currentThread(): ConnectedThread? = synchronized(threadLock) { THREAD }
+
+        /// Clears THREAD if it still points at [t] (or any when t == null) and closes it.
+        private fun dropThread(t: ConnectedThread?) {
+            val old = synchronized(threadLock) {
+                val cur = THREAD
+                if (cur != null && (t == null || cur === t)) {
+                    THREAD = null
+                    cur
+                } else null
+            }
+            if (old != null) {
+                old.cancel()
+                lastClosedAt = System.currentTimeMillis()
+            }
+        }
+
+        /// When a link was last closed, so connect() can let it tear down.
+        @Volatile
+        private var lastClosedAt = 0L
     }
 
     private var mBluetoothAdapter: BluetoothAdapter? = null
-    private var pendingResult: Result? = null
-
     private var readSink: EventSink? = null
     private var statusSink: EventSink? = null
+    private var scanSink: EventSink? = null
 
-    private var pluginBinding: FlutterPlugin.FlutterPluginBinding? = null
-    private var activityBinding: ActivityPluginBinding? = null
-    private val initializationLock = Any()
     private var context: Context? = null
+    private var activity: Activity? = null
     private var channel: MethodChannel? = null
-
     private var stateChannel: EventChannel? = null
     private var readChannel: EventChannel? = null
     private var scanChannel: EventChannel? = null
-    private var mBluetoothManager: BluetoothManager? = null
-    private var scanSink: EventSink? = null
 
-    private var application: Application? = null
-    private var activity: Activity? = null
+    private var stateReceiverRegistered = false
+    private var scanReceiverRegistered = false
 
-    // Coroutine scope for background tasks
-    private val scope = CoroutineScope(Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val exceptionHandler = CoroutineExceptionHandler { _, e -> Log.e(TAG, "Unhandled coroutine error", e) }
+    private var scope = newScope()
+
+    private fun newScope() = CoroutineScope(SupervisorJob() + Dispatchers.IO + exceptionHandler)
+
+    // ---------------------------------------------------------------- lifecycle
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        pluginBinding = binding
+        val messenger = binding.binaryMessenger
+        context = binding.applicationContext
+        scope = newScope()
+        channel = MethodChannel(messenger, "$NAMESPACE/methods").also { it.setMethodCallHandler(this) }
+        stateChannel = EventChannel(messenger, "$NAMESPACE/state").also { it.setStreamHandler(stateStreamHandler) }
+        readChannel = EventChannel(messenger, "$NAMESPACE/read").also { it.setStreamHandler(readResultsHandler) }
+        scanChannel = EventChannel(messenger, "$NAMESPACE/scan").also { it.setStreamHandler(scanStreamHandler) }
+        val manager = context?.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        mBluetoothAdapter = manager?.adapter
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        pluginBinding = null
-    }
-
-    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
-        activityBinding = binding
-        setup(
-            pluginBinding!!.binaryMessenger,
-            pluginBinding!!.applicationContext as Application,
-            activityBinding!!.activity,
-            activityBinding
-        )
-    }
-
-    override fun onDetachedFromActivityForConfigChanges() {
-        onDetachedFromActivity()
-    }
-
-    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
-        onAttachedToActivity(binding)
-    }
-
-    override fun onDetachedFromActivity() {
-        detach()
-    }
-
-    private fun setup(
-        messenger: BinaryMessenger,
-        application: Application?,
-        activity: Activity?,
-        activityBinding: ActivityPluginBinding?
-    ) {
-        synchronized(initializationLock) {
-            Log.i(TAG, "setup")
-            this.activity = activity
-            this.application = application
-            this.context = application
-            channel = MethodChannel(messenger, "$NAMESPACE/methods")
-            channel!!.setMethodCallHandler(this)
-            stateChannel = EventChannel(messenger, "$NAMESPACE/state")
-            stateChannel!!.setStreamHandler(stateStreamHandler)
-            readChannel = EventChannel(messenger, "$NAMESPACE/read")
-            readChannel!!.setStreamHandler(readResultsHandler)
-            scanChannel = EventChannel(messenger, "$NAMESPACE/scan")
-            scanChannel!!.setStreamHandler(scanStreamHandler)
-            mBluetoothManager = (this.context?.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager) ?: (activity?.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)
-            mBluetoothAdapter = mBluetoothManager!!.adapter
-            
-            // V2 embedding setup for activity listeners.
-            activityBinding?.addRequestPermissionsResultListener(this)
-        }
-    }
-
-    private fun detach() {
-        Log.i(TAG, "detach")
-        context = null
-        activityBinding?.removeRequestPermissionsResultListener(this)
-        activityBinding = null
+        stopScan()
+        unregisterStateReceiver()
         channel?.setMethodCallHandler(null)
-        channel = null
         stateChannel?.setStreamHandler(null)
-        stateChannel = null
         readChannel?.setStreamHandler(null)
-        readChannel = null
         scanChannel?.setStreamHandler(null)
-        scanChannel = null
+        channel = null; stateChannel = null; readChannel = null; scanChannel = null
+        readSink = null; statusSink = null; scanSink = null
+        try { scope.cancel() } catch (e: Exception) { Log.e(TAG, "Error cancelling coroutines", e) }
         mBluetoothAdapter = null
-        mBluetoothManager = null
-        application = null
-        
-        try {
-             scope.cancel()
-        } catch(e: Exception) {
-             Log.e(TAG, "Error cancelling coroutines", e)
-        }
+        context = null
     }
 
-    // MethodChannel.Result wrapper that responds on the platform thread.
+    override fun onAttachedToActivity(binding: ActivityPluginBinding) { activity = binding.activity }
+    override fun onDetachedFromActivityForConfigChanges() { activity = null }
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) { activity = binding.activity }
+    override fun onDetachedFromActivity() { activity = null }
+
+    // ---------------------------------------------------------------- results
+
+    /// Replies on the main thread, at most once.
     private class MethodResultWrapper(private val methodResult: Result) : Result {
         private val handler = Handler(Looper.getMainLooper())
+        private val replied = AtomicBoolean(false)
 
-        override fun success(result: Any?) {
-            handler.post { methodResult.success(result) }
+        private fun post(block: () -> Unit) {
+            if (!replied.compareAndSet(false, true)) return
+            if (Looper.myLooper() == Looper.getMainLooper()) runSafe(block) else handler.post { runSafe(block) }
         }
 
-        override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
-            handler.post { methodResult.error(errorCode, errorMessage, errorDetails) }
+        private fun runSafe(block: () -> Unit) {
+            try { block() } catch (e: Exception) { Log.e(TAG, "Failed to send result", e) }
         }
 
-        override fun notImplemented() {
-            handler.post { methodResult.notImplemented() }
-        }
+        override fun success(result: Any?) = post { methodResult.success(result) }
+        override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) =
+            post { methodResult.error(errorCode, errorMessage, errorDetails) }
+        override fun notImplemented() = post { methodResult.notImplemented() }
     }
+
+    private fun postEvent(block: () -> Unit) {
+        mainHandler.post { try { block() } catch (e: Exception) { Log.e(TAG, "event sink error", e) } }
+    }
+
+    // ---------------------------------------------------------------- permissions
+
+    private fun granted(permission: String): Boolean {
+        val ctx = context ?: return false
+        return ContextCompat.checkSelfPermission(ctx, permission) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun hasConnectPermission(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.S || granted(Manifest.permission.BLUETOOTH_CONNECT)
+
+    private fun hasScanPermission(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) granted(Manifest.permission.BLUETOOTH_SCAN)
+        else granted(Manifest.permission.ACCESS_FINE_LOCATION) || granted(Manifest.permission.ACCESS_COARSE_LOCATION)
+
+    // ---------------------------------------------------------------- dispatch
 
     override fun onMethodCall(call: MethodCall, rawResult: Result) {
         val result = MethodResultWrapper(rawResult)
+        try {
+            handle(call, result)
+        } catch (ex: Exception) {
+            // Bad argument types etc. must not crash the platform thread.
+            Log.e(TAG, "${call.method} failed", ex)
+            result.error("error", ex.message, exceptionToString(ex))
+        }
+    }
 
-        if (mBluetoothAdapter == null && "isAvailable" != call.method) {
+    private fun handle(call: MethodCall, result: Result) {
+        val adapter = mBluetoothAdapter
+        if (call.method == "isAvailable") {
+            result.success(adapter != null)
+            return
+        }
+        if (adapter == null) {
             result.error("bluetooth_unavailable", "the device does not have bluetooth", null)
             return
         }
 
-        val arguments = call.arguments as? Map<String, Any>
+        @Suppress("UNCHECKED_CAST")
+        val arguments = call.arguments as? Map<String, Any?>
+        fun str(key: String): String? = arguments?.get(key) as? String
+        fun int(key: String, def: Int = 0): Int = (arguments?.get(key) as? Number)?.toInt() ?: def
 
         when (call.method) {
-            "state" -> state(result)
-            "isAvailable" -> result.success(mBluetoothAdapter != null)
-            "isOn" -> {
-                try {
-                    result.success(mBluetoothAdapter!!.isEnabled)
-                } catch (ex: Exception) {
-                    result.error("Error", ex.message, exceptionToString(ex))
-                }
+            "state" -> result.success(try { adapter.state } catch (e: Exception) { 0 })
+            "isOn" -> result.success(try { adapter.isEnabled } catch (e: Exception) { false })
+            "isConnected" -> result.success(currentThread()?.isAlive == true)
+            "queryStatus" -> {
+                val query = arguments?.get("query") as? ByteArray
+                if (query == null) result.error("invalid_argument", "argument 'query' not found", null)
+                else queryStatus(result, query, int("timeout", 1500))
             }
-            "isConnected" -> result.success(THREAD != null)
             "isDeviceConnected" -> {
-                if (arguments != null && arguments.containsKey("address")) {
-                    val address = arguments["address"] as String
-                    isDeviceConnected(result, address)
-                } else {
-                    result.error("invalid_argument", "argument 'address' not found", null)
-                }
+                val address = str("address")
+                if (address == null) result.error("invalid_argument", "argument 'address' not found", null)
+                else result.success(currentThread()?.let { it.isAlive && it.address.equals(address, true) } == true)
             }
             "openSettings" -> {
-                ContextCompat.startActivity(
-                    context!!,
-                    Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                    null
-                )
+                val ctx = activity ?: context
+                if (ctx == null) { result.success(false); return }
+                val intent = Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)
+                if (ctx !is Activity) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ctx.startActivity(intent)
                 result.success(true)
             }
-            "getBondedDevices" -> {
-                try {
-                    getBondedDevices(result)
-                } catch (ex: Exception) {
-                    result.error("Error", ex.message, exceptionToString(ex))
-                }
-            }
+            "getBondedDevices" -> getBondedDevices(adapter, result)
             "connect" -> {
-                if (arguments != null && arguments.containsKey("address")) {
-                    val address = arguments["address"] as String
-                    connect(result, address)
-                } else {
-                    result.error("invalid_argument", "argument 'address' not found", null)
-                }
+                val address = str("address")
+                if (address == null) result.error("invalid_argument", "argument 'address' not found", null)
+                else connect(adapter, result, address)
             }
             "disconnect" -> disconnect(result)
             "write" -> {
-                if (arguments != null && arguments.containsKey("message")) {
-                    val message = arguments["message"] as String
-                    write(result, message)
-                } else {
-                    result.error("invalid_argument", "argument 'message' not found", null)
-                }
+                val message = str("message")
+                if (message == null) result.error("invalid_argument", "argument 'message' not found", null)
+                else send(result) { message.toByteArray() }
             }
             "writeBytes" -> {
-                if (arguments != null && arguments.containsKey("message")) {
-                    val message = arguments["message"] as ByteArray
-                    writeBytes(result, message)
-                } else {
-                    result.error("invalid_argument", "argument 'message' not found", null)
-                }
+                val message = arguments?.get("message") as? ByteArray
+                if (message == null) result.error("invalid_argument", "argument 'message' not found", null)
+                else send(result) { message }
             }
             "printCustom" -> {
-                if (arguments != null && arguments.containsKey("message")) {
-                    val message = arguments["message"] as String
-                    val size = arguments["size"] as Int
-                    val align = arguments["align"] as Int
-                    val charset = arguments["charset"] as? String
-                    printCustom(result, message, size, align, charset)
-                } else {
-                    result.error("invalid_argument", "argument 'message' not found", null)
-                }
+                val message = str("message")
+                if (message == null) result.error("invalid_argument", "argument 'message' not found", null)
+                else send(result) { customBytes(message, int("size"), int("align"), str("charset")) }
             }
-            "printNewLine" -> printNewLine(result)
-            "paperCut" -> paperCut(result)
+            "printNewLine" -> send(result) { PrinterCommands.FEED_LINE }
+            "paperCut" -> send(result) { PrinterCommands.FEED_PAPER_AND_CUT }
             "printImage" -> {
-                if (arguments != null && arguments.containsKey("pathImage")) {
-                    val pathImage = arguments["pathImage"] as String
-                    printImage(result, pathImage)
-                } else {
-                    result.error("invalid_argument", "argument 'pathImage' not found", null)
-                }
+                val path = str("pathImage")
+                if (path == null) result.error("invalid_argument", "argument 'pathImage' not found", null)
+                else send(result) { imageBytes(BitmapFactory.decodeFile(path)) }
             }
             "printImageBytes" -> {
-                if (arguments != null && arguments.containsKey("bytes")) {
-                    val bytes = arguments["bytes"] as ByteArray
-                    printImageBytes(result, bytes)
-                } else {
-                    result.error("invalid_argument", "argument 'bytes' not found", null)
-                }
+                val bytes = arguments?.get("bytes") as? ByteArray
+                if (bytes == null) result.error("invalid_argument", "argument 'bytes' not found", null)
+                else send(result) { imageBytes(BitmapFactory.decodeByteArray(bytes, 0, bytes.size)) }
             }
             "printLeftRight" -> {
-                if (arguments != null && arguments.containsKey("string1")) {
-                    val string1 = arguments["string1"] as String
-                    val string2 = arguments["string2"] as String
-                    val size = arguments["size"] as Int
-                    val charset = arguments["charset"] as? String
-                    val format = arguments["format"] as? String
-                    printLeftRight(result, string1, string2, size, charset, format)
-                } else {
-                    result.error("invalid_argument", "argument 'message' not found", null)
-                }
+                val s1 = str("string1"); val s2 = str("string2")
+                if (s1 == null || s2 == null) result.error("invalid_argument", "argument 'string1'/'string2' not found", null)
+                else send(result) { columnBytes(int("size"), str("charset"), str("format") ?: "%-15s %15s %n", s1, s2) }
             }
             "print3Column" -> {
-                if (arguments != null && arguments.containsKey("string1")) {
-                    val string1 = arguments["string1"] as String
-                    val string2 = arguments["string2"] as String
-                    val string3 = arguments["string3"] as String
-                    val size = arguments["size"] as Int
-                    val charset = arguments["charset"] as? String
-                    val format = arguments["format"] as? String
-                    print3Column(result, string1, string2, string3, size, charset, format)
-                } else {
-                    result.error("invalid_argument", "argument 'message' not found", null)
-                }
+                val s1 = str("string1"); val s2 = str("string2"); val s3 = str("string3")
+                if (s1 == null || s2 == null || s3 == null) result.error("invalid_argument", "argument 'string1..3' not found", null)
+                else send(result) { columnBytes(int("size"), str("charset"), str("format") ?: "%-10s %10s %10s %n", s1, s2, s3) }
             }
             "print4Column" -> {
-                if (arguments != null && arguments.containsKey("string1")) {
-                    val string1 = arguments["string1"] as String
-                    val string2 = arguments["string2"] as String
-                    val string3 = arguments["string3"] as String
-                    val string4 = arguments["string4"] as String
-                    val size = arguments["size"] as Int
-                    val charset = arguments["charset"] as? String
-                    val format = arguments["format"] as? String
-                    print4Column(result, string1, string2, string3, string4, size, charset, format)
-                } else {
-                    result.error("invalid_argument", "argument 'message' not found", null)
-                }
+                val s1 = str("string1"); val s2 = str("string2"); val s3 = str("string3"); val s4 = str("string4")
+                if (s1 == null || s2 == null || s3 == null || s4 == null) result.error("invalid_argument", "argument 'string1..4' not found", null)
+                else send(result) { columnBytes(int("size"), str("charset"), str("format") ?: "%-8s %7s %7s %7s %n", s1, s2, s3, s4) }
             }
             "pairDevice" -> {
-                if (arguments != null && arguments.containsKey("address")) {
-                    val address = arguments["address"] as String
-                    pairDevice(result, address)
-                } else {
-                    result.error("invalid_argument", "argument 'address' not found", null)
-                }
+                val address = str("address")
+                if (address == null) result.error("invalid_argument", "argument 'address' not found", null)
+                else pairDevice(adapter, result, address)
             }
             "printBatch" -> {
-                if (arguments != null && arguments.containsKey("commands")) {
-                    @Suppress("UNCHECKED_CAST")
-                    val commands = arguments["commands"] as List<Map<String, Any>>
-                    printBatch(result, commands)
-                } else {
-                    result.error("invalid_argument", "argument 'commands' not found", null)
-                }
+                @Suppress("UNCHECKED_CAST")
+                val commands = arguments?.get("commands") as? List<Map<String, Any?>>
+                if (commands == null) result.error("invalid_argument", "argument 'commands' not found", null)
+                else send(result) { batchBytes(commands) }
             }
             else -> result.notImplemented()
         }
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ): Boolean {
-        if (requestCode == REQUEST_COARSE_LOCATION_PERMISSIONS) {
-            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                if(pendingResult != null) getBondedDevices(pendingResult!!)
-            } else {
-                pendingResult?.error("no_permissions", "this plugin requires location permissions for scanning", null)
-                pendingResult = null
-            }
-            return true
-        }
-        return false
+    private fun exceptionToString(ex: Throwable): String {
+        val sw = StringWriter()
+        ex.printStackTrace(PrintWriter(sw))
+        return sw.toString()
     }
 
-    private fun state(result: Result) {
-        try {
-            when (mBluetoothAdapter!!.state) {
-                BluetoothAdapter.STATE_OFF -> result.success(BluetoothAdapter.STATE_OFF)
-                BluetoothAdapter.STATE_ON -> result.success(BluetoothAdapter.STATE_ON)
-                BluetoothAdapter.STATE_TURNING_OFF -> result.success(BluetoothAdapter.STATE_TURNING_OFF)
-                BluetoothAdapter.STATE_TURNING_ON -> result.success(BluetoothAdapter.STATE_TURNING_ON)
-                else -> result.success(0)
-            }
-        } catch (e: SecurityException) {
-            result.error("invalid_argument", "Argument 'address' not found", null)
-        }
-    }
+    // ---------------------------------------------------------------- devices
 
     @SuppressLint("MissingPermission")
-    private fun getBondedDevices(result: Result) {
+    private fun getBondedDevices(adapter: BluetoothAdapter, result: Result) {
+        if (!hasConnectPermission()) {
+            result.error("no_permissions", "BLUETOOTH_CONNECT permission missing", null)
+            return
+        }
         val list: MutableList<Map<String, Any>> = ArrayList()
-        for (device in mBluetoothAdapter!!.bondedDevices) {
-            if (isPrinter(device)) {
+        for (device in adapter.bondedDevices ?: emptySet()) {
+            try {
+                if (!isPrinter(device)) continue
                 val ret: MutableMap<String, Any> = HashMap()
                 ret["address"] = device.address
-                ret["name"] = device.name
+                ret["name"] = device.name ?: device.address
                 ret["type"] = device.type
+                ret["connected"] = linkConnected(device)
+                val battery = batteryLevel(device)
+                if (battery >= 0) ret["battery"] = battery
                 list.add(ret)
+            } catch (e: Exception) {
+                Log.w(TAG, "skipping bonded device: ${e.message}")
             }
         }
         result.success(list)
     }
 
+    /// Battery % the phone knows for [device] (hidden API, Android 8.1+); -1 otherwise.
+    private fun batteryLevel(device: BluetoothDevice): Int = try {
+        (device.javaClass.getMethod("getBatteryLevel").invoke(device) as? Int) ?: -1
+    } catch (e: Exception) { -1 }
+
+    /// Whether the phone currently holds a link to [device] (hidden API).
+    private fun linkConnected(device: BluetoothDevice): Boolean = try {
+        device.javaClass.getMethod("isConnected").invoke(device) as? Boolean ?: false
+    } catch (e: Exception) { false }
+
+    @SuppressLint("MissingPermission")
     private fun isPrinter(device: BluetoothDevice): Boolean {
-        if (device.bluetoothClass != null) {
-            val majorDeviceClass = device.bluetoothClass.majorDeviceClass
-            if (majorDeviceClass == BluetoothClass.Device.Major.IMAGING || majorDeviceClass == BluetoothClass.Device.Major.UNCATEGORIZED) {
-                return true
-            }
-        }
-        return false
+        val cls = try { device.bluetoothClass } catch (e: Exception) { null } ?: return false
+        val major = cls.majorDeviceClass
+        return major == BluetoothClass.Device.Major.IMAGING || major == BluetoothClass.Device.Major.UNCATEGORIZED
     }
 
-    private fun isDeviceConnected(result: Result, address: String) {
-        scope.launch {
-            try {
-                val device = mBluetoothAdapter!!.getRemoteDevice(address)
-                if (device == null) {
-                    result.error("connect_error", "device not found", null)
-                    return@launch
-                }
-                // Warning: ACTION_ACL_CONNECTED check on a specific device this way is tricky and might not be reliable
-                // The original code tried to match actions, which doesn't make sense on a device object instance
-                // But preserving original logic intent: check if thread is active.
-                // Actually, the original code compared `device.ACTION_ACL_CONNECTED` (string constant) with `new Intent(...).getAction()` which is baffling.
-                // It likely meant to check if we are connected to THIS device.
-                // For now, let's just return true if THREAD is not null. Use a more robust check if possible later.
-
-                if (THREAD != null /* && check actual connection if possible */) {
-                     result.success(true)
-                } else {
-                    result.success(false)
-                }
-
-            } catch (ex: Exception) {
-                Log.e(TAG, ex.message, ex)
-                result.error("connect_error", ex.message, exceptionToString(ex))
-            }
+    @SuppressLint("MissingPermission")
+    private fun pairDevice(adapter: BluetoothAdapter, result: Result, address: String) {
+        if (!hasConnectPermission()) {
+            result.error("no_permissions", "BLUETOOTH_CONNECT permission missing", null)
+            return
+        }
+        try {
+            val device = adapter.getRemoteDevice(address)
+            if (device.bondState == BluetoothDevice.BOND_BONDED) result.success(true)
+            else result.success(device.createBond())
+        } catch (ex: Exception) {
+            result.error("error", ex.message, null)
         }
     }
 
-    private fun exceptionToString(ex: Exception): String {
-        val sw = StringWriter()
-        val pw = PrintWriter(sw)
-        ex.printStackTrace(pw)
-        return sw.toString()
-    }
+    // ---------------------------------------------------------------- connection
 
-    private fun connect(result: Result, address: String) {
-        if (THREAD != null) {
-            result.error("connect_error", "already connected", null)
+    @SuppressLint("MissingPermission")
+    private fun connect(adapter: BluetoothAdapter, result: Result, address: String) {
+        if (!hasConnectPermission()) {
+            result.error("no_permissions", "BLUETOOTH_CONNECT permission missing", null)
+            return
+        }
+        val existing = currentThread()
+        if (existing != null && existing.isAlive && existing.address.equals(address, true)) {
+            result.success(true) // already connected to this printer
             return
         }
         scope.launch {
             try {
-                val device = mBluetoothAdapter!!.getRemoteDevice(address)
-                if (device == null) {
-                    result.error("connect_error", "device not found", null)
-                    return@launch
-                }
-
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S &&
-                    ActivityCompat.checkSelfPermission(context!!, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                    result.error("no_permissions", "BLUETOOTH_CONNECT permission missing", null)
-                    return@launch
-                }
-
-                mBluetoothAdapter!!.cancelDiscovery()
+                // Close any previous (other / dead) link first.
+                dropThread(null)
+                // Reopening RFCOMM right after a close (disconnect -> tap the
+                // printer again) fails or hangs on many printers until the
+                // old channel has torn down.
+                val since = System.currentTimeMillis() - lastClosedAt
+                if (since in 0 until 800) kotlinx.coroutines.delay(800 - since)
+                val device = adapter.getRemoteDevice(address)
+                try { if (hasScanPermission()) adapter.cancelDiscovery() } catch (ignored: Exception) {}
 
                 var socket: BluetoothSocket? = null
-                var connected = false
+                val attempts: List<() -> BluetoothSocket> = listOf(
+                    { device.createRfcommSocketToServiceRecord(MY_UUID) },
+                    { device.createInsecureRfcommSocketToServiceRecord(MY_UUID) },
+                    {
+                        device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+                            .invoke(device, 1) as BluetoothSocket
+                    },
+                )
+                var lastError: Exception? = null
+                for (create in attempts) {
+                    var s: BluetoothSocket? = null
+                    try {
+                        s = create()
+                        s.connect()
+                        socket = s
+                        break
+                    } catch (e: Exception) {
+                        lastError = e
+                        Log.w(TAG, "connect attempt failed: ${e.message}")
+                        try { s?.close() } catch (ignored: Exception) {}
+                    }
+                }
 
-                // Strategy 1: Standard Secure RFCOMM
-                try {
-                    socket = device.createRfcommSocketToServiceRecord(MY_UUID)
-                    socket.connect()
-                    connected = true
+                if (socket == null) {
+                    result.error("connect_error", "Could not connect to device: ${lastError?.message}", null)
+                    return@launch
+                }
+                val thread = try {
+                    ConnectedThread(socket, address)
                 } catch (e: Exception) {
-                    Log.w(TAG, "Standard connection failed: ${e.message}. Retrying with fallback...")
-                    try {
-                        socket?.close()
-                    } catch (ignored: Exception) {}
+                    try { socket.close() } catch (ignored: Exception) {}
+                    throw e
                 }
-
-                // Strategy 2: Insecure RFCOMM (Fallback)
-                if (!connected) {
-                    try {
-                        socket = device.createInsecureRfcommSocketToServiceRecord(MY_UUID)
-                        socket.connect()
-                        connected = true
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Insecure connection failed: ${e.message}. Retrying with reflection...")
-                        try {
-                            socket?.close()
-                        } catch (ignored: Exception) {}
-                    }
-                }
-
-                // Strategy 3: Reflection (Last Resort for some devices)
-                if (!connected) {
-                    try {
-                        val method = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
-                        socket = method.invoke(device, 1) as BluetoothSocket
-                        socket.connect()
-                        connected = true
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Reflection connection failed: ${e.message}")
-                        try {
-                            socket?.close()
-                        } catch (ignored: Exception) {}
-                    }
-                }
-
-                if (connected && socket != null) {
-                     THREAD = ConnectedThread(socket)
-                     THREAD!!.start()
-                     result.success(true)
-                } else {
-                     result.error("connect_error", "Could not connect to device after multiple attempts", null)
-                }
-
+                val old = synchronized(threadLock) { val o = THREAD; THREAD = thread; o }
+                old?.cancel()
+                thread.start()
+                result.success(true)
             } catch (ex: Exception) {
                 Log.e(TAG, ex.message, ex)
                 result.error("connect_error", ex.message, exceptionToString(ex))
@@ -505,261 +419,36 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
     }
 
     private fun disconnect(result: Result) {
-        if (THREAD == null) {
+        val thread = currentThread()
+        if (thread == null) {
             result.error("disconnection_error", "not connected", null)
             return
         }
         scope.launch {
-            try {
-                THREAD!!.cancel()
-                THREAD = null
-                result.success(true)
-            } catch (ex: Exception) {
-                Log.e(TAG, ex.message, ex)
-                result.error("disconnection_error", ex.message, exceptionToString(ex))
-            }
-        }
-    }
-
-    private fun write(result: Result, message: String) {
-        if (THREAD == null) {
-            result.error("write_error", "not connected", null)
-            return
-        }
-        try {
-            THREAD!!.write(message.toByteArray())
-            THREAD!!.flush()
+            dropThread(thread)
             result.success(true)
-        } catch (ex: Exception) {
-            Log.e(TAG, ex.message, ex)
-            result.error("write_error", ex.message, exceptionToString(ex))
         }
     }
 
-    private fun writeBytes(result: Result, message: ByteArray) {
-        if (THREAD == null) {
-            result.error("write_error", "not connected", null)
-            return
-        }
-        try {
-            // Use chunked writes for large payloads (e.g. images)
-            if (message.size > 2048) {
-                THREAD!!.writeChunked(message)
-            } else {
-                THREAD!!.write(message)
-                THREAD!!.flush()
-            }
-            result.success(true)
-        } catch (ex: Exception) {
-            Log.e(TAG, ex.message, ex)
-            result.error("write_error", ex.message, exceptionToString(ex))
-        }
-    }
+    // ---------------------------------------------------------------- writing
 
-    private fun printCustom(result: Result, message: String, size: Int, align: Int, charset: String?) {
-        val cc = byteArrayOf(0x1B, 0x21, 0x03) // 0- normal size text
-        val bb = byteArrayOf(0x1B, 0x21, 0x08) // 1- only bold text
-        val bb2 = byteArrayOf(0x1B, 0x21, 0x20) // 2- bold with medium text
-        val bb3 = byteArrayOf(0x1B, 0x21, 0x10) // 3- bold with large text
-        val bb4 = byteArrayOf(0x1B, 0x21, 0x30) // 4- strong text
-
-        if (THREAD == null) {
-            result.error("write_error", "not connected", null)
-            return
-        }
-
-        try {
-            // Build complete command as single byte array to minimize BT packets
-            val sizeCmd = when (size) {
-                0 -> cc; 1 -> bb; 2 -> bb2; 3 -> bb3; 4 -> bb4
-                else -> cc
-            }
-            val alignCmd = when (align) {
-                0 -> PrinterCommands.ESC_ALIGN_LEFT
-                1 -> PrinterCommands.ESC_ALIGN_CENTER
-                2 -> PrinterCommands.ESC_ALIGN_RIGHT
-                else -> PrinterCommands.ESC_ALIGN_LEFT
-            }
-            val msgBytes = if (charset != null) {
-                message.toByteArray(java.nio.charset.Charset.forName(charset))
-            } else {
-                message.toByteArray()
-            }
-
-            // Combine into single write: sizeCmd + alignCmd + message + newline
-            val combined = ByteArray(sizeCmd.size + alignCmd.size + msgBytes.size + PrinterCommands.FEED_LINE.size)
-            var offset = 0
-            System.arraycopy(sizeCmd, 0, combined, offset, sizeCmd.size); offset += sizeCmd.size
-            System.arraycopy(alignCmd, 0, combined, offset, alignCmd.size); offset += alignCmd.size
-            System.arraycopy(msgBytes, 0, combined, offset, msgBytes.size); offset += msgBytes.size
-            System.arraycopy(PrinterCommands.FEED_LINE, 0, combined, offset, PrinterCommands.FEED_LINE.size)
-
-            THREAD!!.write(combined)
-            THREAD!!.flush()
-            result.success(true)
-        } catch (ex: Exception) {
-            Log.e(TAG, ex.message, ex)
-            result.error("write_error", ex.message, exceptionToString(ex))
-        }
-    }
-
-    private fun printLeftRight(result: Result, msg1: String, msg2: String, size: Int, charset: String?, format: String?) {
-        val cc = byteArrayOf(0x1B, 0x21, 0x03)
-        val bb = byteArrayOf(0x1B, 0x21, 0x08)
-        val bb2 = byteArrayOf(0x1B, 0x21, 0x20)
-        val bb3 = byteArrayOf(0x1B, 0x21, 0x10)
-        val bb4 = byteArrayOf(0x1B, 0x21, 0x30)
-
-        if (THREAD == null) {
-            result.error("write_error", "not connected", null)
-            return
-        }
-        try {
-            val sizeCmd = when (size) {
-                0 -> cc; 1 -> bb; 2 -> bb2; 3 -> bb3; 4 -> bb4; else -> cc
-            }
-            var line = if (format != null) String.format(format, msg1, msg2)
-                       else String.format("%-15s %15s %n", msg1, msg2)
-            val msgBytes = if (charset != null) line.toByteArray(java.nio.charset.Charset.forName(charset))
-                           else line.toByteArray()
-
-            // Single combined write
-            val combined = ByteArray(sizeCmd.size + PrinterCommands.ESC_ALIGN_CENTER.size + msgBytes.size)
-            var offset = 0
-            System.arraycopy(sizeCmd, 0, combined, offset, sizeCmd.size); offset += sizeCmd.size
-            System.arraycopy(PrinterCommands.ESC_ALIGN_CENTER, 0, combined, offset, PrinterCommands.ESC_ALIGN_CENTER.size); offset += PrinterCommands.ESC_ALIGN_CENTER.size
-            System.arraycopy(msgBytes, 0, combined, offset, msgBytes.size)
-
-            THREAD!!.write(combined)
-            THREAD!!.flush()
-            result.success(true)
-        } catch (ex: Exception) {
-            Log.e(TAG, ex.message, ex)
-            result.error("write_error", ex.message, exceptionToString(ex))
-        }
-    }
-
-    private fun print3Column(result: Result, msg1: String, msg2: String, msg3: String, size: Int, charset: String?, format: String?) {
-        val cc = byteArrayOf(0x1B, 0x21, 0x03)
-        val bb = byteArrayOf(0x1B, 0x21, 0x08)
-        val bb2 = byteArrayOf(0x1B, 0x21, 0x20)
-        val bb3 = byteArrayOf(0x1B, 0x21, 0x10)
-        val bb4 = byteArrayOf(0x1B, 0x21, 0x30)
-
-        if (THREAD == null) {
-            result.error("write_error", "not connected", null)
-            return
-        }
-        try {
-            val sizeCmd = when (size) {
-                0 -> cc; 1 -> bb; 2 -> bb2; 3 -> bb3; 4 -> bb4; else -> cc
-            }
-            var line = if (format != null) String.format(format, msg1, msg2, msg3)
-                       else String.format("%-10s %10s %10s %n", msg1, msg2, msg3)
-            val msgBytes = if (charset != null) line.toByteArray(java.nio.charset.Charset.forName(charset))
-                           else line.toByteArray()
-
-            val combined = ByteArray(sizeCmd.size + PrinterCommands.ESC_ALIGN_CENTER.size + msgBytes.size)
-            var offset = 0
-            System.arraycopy(sizeCmd, 0, combined, offset, sizeCmd.size); offset += sizeCmd.size
-            System.arraycopy(PrinterCommands.ESC_ALIGN_CENTER, 0, combined, offset, PrinterCommands.ESC_ALIGN_CENTER.size); offset += PrinterCommands.ESC_ALIGN_CENTER.size
-            System.arraycopy(msgBytes, 0, combined, offset, msgBytes.size)
-
-            THREAD!!.write(combined)
-            THREAD!!.flush()
-            result.success(true)
-        } catch (ex: Exception) {
-            Log.e(TAG, ex.message, ex)
-            result.error("write_error", ex.message, exceptionToString(ex))
-        }
-    }
-
-    private fun print4Column(result: Result, msg1: String, msg2: String, msg3: String, msg4: String, size: Int, charset: String?, format: String?) {
-        val cc = byteArrayOf(0x1B, 0x21, 0x03)
-        val bb = byteArrayOf(0x1B, 0x21, 0x08)
-        val bb2 = byteArrayOf(0x1B, 0x21, 0x20)
-        val bb3 = byteArrayOf(0x1B, 0x21, 0x10)
-        val bb4 = byteArrayOf(0x1B, 0x21, 0x30)
-
-        if (THREAD == null) {
-            result.error("write_error", "not connected", null)
-            return
-        }
-        try {
-            val sizeCmd = when (size) {
-                0 -> cc; 1 -> bb; 2 -> bb2; 3 -> bb3; 4 -> bb4; else -> cc
-            }
-            var line = if (format != null) String.format(format, msg1, msg2, msg3, msg4)
-                       else String.format("%-8s %7s %7s %7s %n", msg1, msg2, msg3, msg4)
-            val msgBytes = if (charset != null) line.toByteArray(java.nio.charset.Charset.forName(charset))
-                           else line.toByteArray()
-
-            val combined = ByteArray(sizeCmd.size + PrinterCommands.ESC_ALIGN_CENTER.size + msgBytes.size)
-            var offset = 0
-            System.arraycopy(sizeCmd, 0, combined, offset, sizeCmd.size); offset += sizeCmd.size
-            System.arraycopy(PrinterCommands.ESC_ALIGN_CENTER, 0, combined, offset, PrinterCommands.ESC_ALIGN_CENTER.size); offset += PrinterCommands.ESC_ALIGN_CENTER.size
-            System.arraycopy(msgBytes, 0, combined, offset, msgBytes.size)
-
-            THREAD!!.write(combined)
-            THREAD!!.flush()
-            result.success(true)
-        } catch (ex: Exception) {
-            Log.e(TAG, ex.message, ex)
-            result.error("write_error", ex.message, exceptionToString(ex))
-        }
-    }
-
-    private fun printNewLine(result: Result) {
-        if (THREAD == null) {
-            result.error("write_error", "not connected", null)
-            return
-        }
-        try {
-            THREAD!!.write(PrinterCommands.FEED_LINE)
-            THREAD!!.flush()
-            result.success(true)
-        } catch (ex: Exception) {
-            Log.e(TAG, ex.message, ex)
-            result.error("write_error", ex.message, exceptionToString(ex))
-        }
-    }
-
-    private fun paperCut(result: Result) {
-        if (THREAD == null) {
-            result.error("write_error", "not connected", null)
-            return
-        }
-        try {
-            THREAD!!.write(PrinterCommands.FEED_PAPER_AND_CUT)
-            THREAD!!.flush()
-            result.success(true)
-        } catch (ex: Exception) {
-            Log.e(TAG, ex.message, ex)
-            result.error("write_error", ex.message, exceptionToString(ex))
-        }
-    }
-
-    private fun printImage(result: Result, pathImage: String) {
-        if (THREAD == null) {
+    /// Builds bytes and writes them on the IO scope; replies true, or
+    /// write_error when not connected / the socket failed (link then dropped).
+    private fun send(result: Result, build: () -> ByteArray?) {
+        val thread = currentThread()
+        if (thread == null) {
             result.error("write_error", "not connected", null)
             return
         }
         scope.launch {
             try {
-                val bmp = BitmapFactory.decodeFile(pathImage)
-                if (bmp != null) {
-                    val command = Utils.decodeBitmap(bmp)
-                    if (command != null) {
-                        // Combine alignment + image data and use chunked write
-                        val combined = ByteArray(PrinterCommands.ESC_ALIGN_CENTER.size + command.size)
-                        System.arraycopy(PrinterCommands.ESC_ALIGN_CENTER, 0, combined, 0, PrinterCommands.ESC_ALIGN_CENTER.size)
-                        System.arraycopy(command, 0, combined, PrinterCommands.ESC_ALIGN_CENTER.size, command.size)
-                        THREAD!!.writeChunked(combined)
-                    }
-                } else {
-                    Log.e("Print Photo error", "the file doesn't exist")
-                }
+                val bytes = build()
+                if (bytes != null && bytes.isNotEmpty()) thread.writeAll(bytes)
                 result.success(true)
+            } catch (ex: IOException) {
+                Log.e(TAG, "write failed, dropping connection", ex)
+                dropThread(thread)
+                result.error("write_error", ex.message ?: "write failed", exceptionToString(ex))
             } catch (ex: Exception) {
                 Log.e(TAG, ex.message, ex)
                 result.error("write_error", ex.message, exceptionToString(ex))
@@ -767,355 +456,311 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler, 
         }
     }
 
-    private fun printImageBytes(result: Result, bytes: ByteArray) {
-        if (THREAD == null) {
-            result.error("write_error", "not connected", null)
+    private fun queryStatus(result: Result, query: ByteArray, timeoutMs: Int) {
+        val thread = currentThread()
+        if (thread == null) {
+            result.success(null)
             return
         }
         scope.launch {
-            try {
-                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                if (bmp != null) {
-                    val command = Utils.decodeBitmap(bmp)
-                    if (command != null) {
-                        val combined = ByteArray(PrinterCommands.ESC_ALIGN_CENTER.size + command.size)
-                        System.arraycopy(PrinterCommands.ESC_ALIGN_CENTER, 0, combined, 0, PrinterCommands.ESC_ALIGN_CENTER.size)
-                        System.arraycopy(command, 0, combined, PrinterCommands.ESC_ALIGN_CENTER.size, command.size)
-                        THREAD!!.writeChunked(combined)
-                    }
-                } else {
-                    Log.e("Print Photo error", "the file doesn't exist")
-                }
-                result.success(true)
-            } catch (ex: Exception) {
-                Log.e(TAG, ex.message, ex)
-                result.error("write_error", ex.message, exceptionToString(ex))
+            val reply = try {
+                thread.request(query, timeoutMs.toLong())
+            } catch (e: IOException) {
+                dropThread(thread)
+                null
+            } catch (e: Exception) {
+                null
             }
+            result.success(reply)
         }
+    }
+
+    private fun sizeCmd(size: Int): ByteArray = when (size) {
+        1 -> byteArrayOf(0x1B, 0x21, 0x08)
+        2 -> byteArrayOf(0x1B, 0x21, 0x20)
+        3 -> byteArrayOf(0x1B, 0x21, 0x10)
+        4 -> byteArrayOf(0x1B, 0x21, 0x30)
+        else -> byteArrayOf(0x1B, 0x21, 0x03)
+    }
+
+    private fun alignCmd(align: Int): ByteArray = when (align) {
+        1 -> PrinterCommands.ESC_ALIGN_CENTER
+        2 -> PrinterCommands.ESC_ALIGN_RIGHT
+        else -> PrinterCommands.ESC_ALIGN_LEFT
+    }
+
+    private fun encode(message: String, charset: String?): ByteArray =
+        if (charset != null) message.toByteArray(java.nio.charset.Charset.forName(charset)) else message.toByteArray()
+
+    private fun customBytes(message: String, size: Int, align: Int, charset: String?): ByteArray =
+        sizeCmd(size) + alignCmd(align) + encode(message, charset) + PrinterCommands.FEED_LINE
+
+    private fun columnBytes(size: Int, charset: String?, format: String, vararg cols: String): ByteArray =
+        sizeCmd(size) + PrinterCommands.ESC_ALIGN_CENTER + encode(String.format(format, *cols), charset)
+
+    private fun imageBytes(bmp: android.graphics.Bitmap?): ByteArray? {
+        if (bmp == null) {
+            Log.e(TAG, "printImage: could not decode image")
+            return null
+        }
+        val command = Utils.decodeBitmap(bmp) ?: return null
+        return PrinterCommands.ESC_ALIGN_CENTER + command
     }
 
     /**
-     * Batch print: receives a list of commands, builds a single byte buffer,
-     * and sends it all in one go. This eliminates per-command Dart→Native round-trips
-     * and reduces the number of Bluetooth packets drastically.
-     *
-     * Each command map has a "type" key and type-specific parameters.
+     * Batch print: one buffer for all commands.
      * Supported types: "custom", "leftRight", "3column", "4column", "newLine", "paperCut", "rawBytes"
      */
-    private fun printBatch(result: Result, commands: List<Map<String, Any>>) {
-        if (THREAD == null) {
-            result.error("write_error", "not connected", null)
-            return
-        }
-
-        val cc = byteArrayOf(0x1B, 0x21, 0x03)
-        val bb = byteArrayOf(0x1B, 0x21, 0x08)
-        val bb2 = byteArrayOf(0x1B, 0x21, 0x20)
-        val bb3 = byteArrayOf(0x1B, 0x21, 0x10)
-        val bb4 = byteArrayOf(0x1B, 0x21, 0x30)
-
-        try {
-            val buffer = java.io.ByteArrayOutputStream(4096)
-
-            for (cmd in commands) {
-                val type = cmd["type"] as? String ?: continue
-
-                fun sizeCmd(size: Int): ByteArray = when (size) {
-                    0 -> cc; 1 -> bb; 2 -> bb2; 3 -> bb3; 4 -> bb4; else -> cc
+    private fun batchBytes(commands: List<Map<String, Any?>>): ByteArray {
+        val buffer = ByteArrayOutputStream(4096)
+        for (cmd in commands) {
+            val type = cmd["type"] as? String ?: continue
+            val size = (cmd["size"] as? Number)?.toInt() ?: 0
+            val charset = cmd["charset"] as? String
+            val format = cmd["format"] as? String
+            fun s(k: String) = cmd[k] as? String
+            when (type) {
+                "custom" -> {
+                    val m = s("message") ?: continue
+                    buffer.write(customBytes(m, size, (cmd["align"] as? Number)?.toInt() ?: 0, charset))
                 }
-
-                fun alignCmd(align: Int): ByteArray = when (align) {
-                    0 -> PrinterCommands.ESC_ALIGN_LEFT
-                    1 -> PrinterCommands.ESC_ALIGN_CENTER
-                    2 -> PrinterCommands.ESC_ALIGN_RIGHT
-                    else -> PrinterCommands.ESC_ALIGN_LEFT
+                "leftRight" -> {
+                    val a = s("string1") ?: continue; val b = s("string2") ?: continue
+                    buffer.write(columnBytes(size, charset, format ?: "%-15s %15s %n", a, b))
                 }
-
-                fun encodeMsg(message: String, charset: String?): ByteArray {
-                    return if (charset != null) message.toByteArray(java.nio.charset.Charset.forName(charset))
-                    else message.toByteArray()
+                "3column" -> {
+                    val a = s("string1") ?: continue; val b = s("string2") ?: continue; val c = s("string3") ?: continue
+                    buffer.write(columnBytes(size, charset, format ?: "%-10s %10s %10s %n", a, b, c))
                 }
-
-                when (type) {
-                    "custom" -> {
-                        val message = cmd["message"] as? String ?: continue
-                        val size = (cmd["size"] as? Int) ?: 0
-                        val align = (cmd["align"] as? Int) ?: 0
-                        val charset = cmd["charset"] as? String
-                        buffer.write(sizeCmd(size))
-                        buffer.write(alignCmd(align))
-                        buffer.write(encodeMsg(message, charset))
-                        buffer.write(PrinterCommands.FEED_LINE)
-                    }
-                    "leftRight" -> {
-                        val s1 = cmd["string1"] as? String ?: continue
-                        val s2 = cmd["string2"] as? String ?: continue
-                        val size = (cmd["size"] as? Int) ?: 0
-                        val charset = cmd["charset"] as? String
-                        val format = cmd["format"] as? String
-                        val line = if (format != null) String.format(format, s1, s2)
-                                   else String.format("%-15s %15s %n", s1, s2)
-                        buffer.write(sizeCmd(size))
-                        buffer.write(PrinterCommands.ESC_ALIGN_CENTER)
-                        buffer.write(encodeMsg(line, charset))
-                    }
-                    "3column" -> {
-                        val s1 = cmd["string1"] as? String ?: continue
-                        val s2 = cmd["string2"] as? String ?: continue
-                        val s3 = cmd["string3"] as? String ?: continue
-                        val size = (cmd["size"] as? Int) ?: 0
-                        val charset = cmd["charset"] as? String
-                        val format = cmd["format"] as? String
-                        val line = if (format != null) String.format(format, s1, s2, s3)
-                                   else String.format("%-10s %10s %10s %n", s1, s2, s3)
-                        buffer.write(sizeCmd(size))
-                        buffer.write(PrinterCommands.ESC_ALIGN_CENTER)
-                        buffer.write(encodeMsg(line, charset))
-                    }
-                    "4column" -> {
-                        val s1 = cmd["string1"] as? String ?: continue
-                        val s2 = cmd["string2"] as? String ?: continue
-                        val s3 = cmd["string3"] as? String ?: continue
-                        val s4 = cmd["string4"] as? String ?: continue
-                        val size = (cmd["size"] as? Int) ?: 0
-                        val charset = cmd["charset"] as? String
-                        val format = cmd["format"] as? String
-                        val line = if (format != null) String.format(format, s1, s2, s3, s4)
-                                   else String.format("%-8s %7s %7s %7s %n", s1, s2, s3, s4)
-                        buffer.write(sizeCmd(size))
-                        buffer.write(PrinterCommands.ESC_ALIGN_CENTER)
-                        buffer.write(encodeMsg(line, charset))
-                    }
-                    "newLine" -> {
-                        buffer.write(PrinterCommands.FEED_LINE)
-                    }
-                    "paperCut" -> {
-                        buffer.write(PrinterCommands.FEED_PAPER_AND_CUT)
-                    }
-                    "rawBytes" -> {
-                        val bytes = cmd["bytes"] as? ByteArray
-                        if (bytes != null) buffer.write(bytes)
-                    }
+                "4column" -> {
+                    val a = s("string1") ?: continue; val b = s("string2") ?: continue
+                    val c = s("string3") ?: continue; val d = s("string4") ?: continue
+                    buffer.write(columnBytes(size, charset, format ?: "%-8s %7s %7s %7s %n", a, b, c, d))
                 }
+                "newLine" -> buffer.write(PrinterCommands.FEED_LINE)
+                "paperCut" -> buffer.write(PrinterCommands.FEED_PAPER_AND_CUT)
+                "rawBytes" -> (cmd["bytes"] as? ByteArray)?.let { buffer.write(it) }
             }
-
-            val allBytes = buffer.toByteArray()
-            if (allBytes.size > 2048) {
-                THREAD!!.writeChunked(allBytes)
-            } else {
-                THREAD!!.write(allBytes)
-                THREAD!!.flush()
-            }
-            result.success(true)
-        } catch (ex: Exception) {
-            Log.e(TAG, ex.message, ex)
-            result.error("write_error", ex.message, exceptionToString(ex))
         }
+        return buffer.toByteArray()
     }
 
-    // Inner class for connection thread
-    private inner class ConnectedThread(private val mmSocket: BluetoothSocket) : Thread() {
-        private val inputStream: InputStream?
-        private val outputStream: OutputStream?
-        private val bufferedOutputStream: BufferedOutputStream?
+    // ---------------------------------------------------------------- connected thread
 
-        // Optimal chunk size for Bluetooth Classic SPP (Serial Port Profile).
-        // Most BT adapters have a ~4KB buffer; writing in chunks prevents overflow.
+    private inner class ConnectedThread(private val mmSocket: BluetoothSocket, val address: String) : Thread() {
+        private val inputStream: InputStream = mmSocket.inputStream
+        private val outputStream: OutputStream = mmSocket.outputStream
+        private val writeLock = Any()
+        @Volatile private var closed = false
+
+        // Bluetooth SPP adapters have a ~4KB buffer; chunked writes avoid overflow.
         private val CHUNK_SIZE = 2048
 
-        init {
-            var tmpIn: InputStream? = null
-            var tmpOut: OutputStream? = null
+        /// Raw reads from [run], for [request] to wait on.
+        private val replies = LinkedBlockingQueue<ByteArray>()
 
-            try {
-                tmpIn = mmSocket.inputStream
-                tmpOut = mmSocket.outputStream
-            } catch (e: IOException) {
-                e.printStackTrace()
-            }
-            inputStream = tmpIn
-            outputStream = tmpOut
-            bufferedOutputStream = if (tmpOut != null) BufferedOutputStream(tmpOut, 4096) else null
-        }
+        init { isDaemon = true; name = "drago-bt-reader" }
 
         override fun run() {
             val buffer = ByteArray(1024)
-            var bytes: Int
-            while (true) {
+            while (!closed) {
                 try {
-                    bytes = inputStream!!.read(buffer)
+                    val bytes = inputStream.read(buffer)
+                    // -1 = the printer closed the link (TSPL printers do this after a job).
+                    if (bytes < 0) break
+                    if (bytes == 0) continue
+                    replies.offer(buffer.copyOf(bytes))
                     val message = String(buffer, 0, bytes)
-                    mainHandler.post {
-                         readSink?.success(message)
-                    }
-                } catch (e: NullPointerException) {
-                    break
-                } catch (e: IOException) {
+                    postEvent { readSink?.success(message) }
+                } catch (e: Exception) {
+                    // Uncaught throws here would kill the app -- end the reader instead.
                     break
                 }
             }
+            // Link is gone: mark disconnected so isConnected/writes see it.
+            if (!closed) dropThread(this)
         }
 
-        /**
-         * Write bytes to the buffered output stream without flushing.
-         * Use [flush] after a complete command sequence for best performance.
-         */
-        fun write(bytes: ByteArray) {
-            try {
-                bufferedOutputStream!!.write(bytes)
-            } catch (e: IOException) {
-                e.printStackTrace()
-            }
+        /// Writes [query] and returns the first reply within [timeoutMs].
+        @Throws(IOException::class)
+        fun request(query: ByteArray, timeoutMs: Long): ByteArray? {
+            replies.clear()
+            writeAll(query)
+            return replies.poll(timeoutMs, TimeUnit.MILLISECONDS)
         }
 
-        /**
-         * Write bytes in chunks and flush — ideal for large data like images.
-         * Prevents Bluetooth buffer overflow on large payloads.
-         */
-        fun writeChunked(bytes: ByteArray) {
-            try {
+        /// Writes all [bytes] (chunked when large) and flushes. Throws IOException on failure.
+        @Throws(IOException::class)
+        fun writeAll(bytes: ByteArray) {
+            if (closed) throw IOException("connection closed")
+            synchronized(writeLock) {
                 var offset = 0
                 while (offset < bytes.size) {
                     val length = minOf(CHUNK_SIZE, bytes.size - offset)
-                    bufferedOutputStream!!.write(bytes, offset, length)
-                    bufferedOutputStream.flush()
+                    outputStream.write(bytes, offset, length)
+                    outputStream.flush()
                     offset += length
-                    // Small delay between chunks to let the printer's buffer drain
                     if (offset < bytes.size) {
-                        Thread.sleep(5)
+                        try { sleep(5) } catch (e: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            throw IOException("write interrupted")
+                        }
                     }
                 }
-            } catch (e: IOException) {
-                e.printStackTrace()
-            } catch (e: InterruptedException) {
-                e.printStackTrace()
-            }
-        }
-
-        /**
-         * Flush the buffered output stream, sending all pending bytes.
-         */
-        fun flush() {
-            try {
-                bufferedOutputStream?.flush()
-            } catch (e: IOException) {
-                e.printStackTrace()
             }
         }
 
         fun cancel() {
+            closed = true
+            try { outputStream.flush() } catch (ignored: Exception) {}
+            try { outputStream.close() } catch (ignored: Exception) {}
+            try { inputStream.close() } catch (ignored: Exception) {}
+            try { mmSocket.close() } catch (ignored: Exception) {}
+        }
+    }
+
+    // ---------------------------------------------------------------- receivers
+
+    private fun register(receiver: BroadcastReceiver, filter: IntentFilter): Boolean {
+        val ctx = context ?: return false
+        return try {
+            if (Build.VERSION.SDK_INT >= 33) ctx.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+            else ctx.registerReceiver(receiver, filter)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "registerReceiver failed", e)
+            false
+        }
+    }
+
+    private fun unregister(receiver: BroadcastReceiver) {
+        try { context?.unregisterReceiver(receiver) } catch (e: Exception) { Log.w(TAG, "unregisterReceiver: ${e.message}") }
+    }
+
+    private fun deviceAddress(intent: Intent): String? = try {
+        @Suppress("DEPRECATION")
+        intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)?.address
+    } catch (e: Exception) { null }
+
+    /// True when the ACL event is for our printer (or we can't tell).
+    private fun isOurDevice(intent: Intent): Boolean {
+        val ours = currentThread()?.address ?: return false
+        val addr = deviceAddress(intent) ?: return true
+        return ours.equals(addr, true)
+    }
+
+    private val stateReceiver: BroadcastReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
             try {
-                bufferedOutputStream?.flush()
-                bufferedOutputStream?.close()
-                inputStream?.close()
-                mmSocket.close()
-            } catch (e: IOException) {
-                e.printStackTrace()
+                when (intent.action) {
+                    BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                        val st = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1)
+                        if (st == BluetoothAdapter.STATE_TURNING_OFF || st == BluetoothAdapter.STATE_OFF) dropThread(null)
+                        statusSink?.success(st)
+                    }
+                    BluetoothDevice.ACTION_ACL_CONNECTED -> statusSink?.success(1)
+                    BluetoothDevice.ACTION_ACL_DISCONNECT_REQUESTED -> {
+                        if (isOurDevice(intent)) dropThread(null)
+                        statusSink?.success(2)
+                    }
+                    BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
+                        if (isOurDevice(intent)) dropThread(null)
+                        statusSink?.success(0)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "state receiver error", e)
             }
+        }
+    }
+
+    private fun unregisterStateReceiver() {
+        if (stateReceiverRegistered) {
+            stateReceiverRegistered = false
+            unregister(stateReceiver)
         }
     }
 
     private val stateStreamHandler: StreamHandler = object : StreamHandler {
-        private val mReceiver: BroadcastReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context, intent: Intent) {
-                val action = intent.action
-                Log.d(TAG, action!!)
-
-                when (action) {
-                    BluetoothAdapter.ACTION_STATE_CHANGED -> {
-                        THREAD = null
-                        statusSink?.success(intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1))
-                    }
-                    BluetoothDevice.ACTION_ACL_CONNECTED -> {
-                        statusSink?.success(1)
-                    }
-                    BluetoothDevice.ACTION_ACL_DISCONNECT_REQUESTED -> {
-                        THREAD = null
-                        statusSink?.success(2)
-                    }
-                    BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
-                        THREAD = null
-                        statusSink?.success(0)
-                    }
-                }
-            }
-        }
-
         override fun onListen(o: Any?, eventSink: EventSink) {
             statusSink = eventSink
-            context!!.registerReceiver(mReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
-            context!!.registerReceiver(mReceiver, IntentFilter(BluetoothDevice.ACTION_ACL_CONNECTED))
-            context!!.registerReceiver(mReceiver, IntentFilter(BluetoothDevice.ACTION_ACL_DISCONNECT_REQUESTED))
-            context!!.registerReceiver(mReceiver, IntentFilter(BluetoothDevice.ACTION_ACL_DISCONNECTED))
+            if (stateReceiverRegistered) return
+            val filter = IntentFilter().apply {
+                addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+                addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
+                addAction(BluetoothDevice.ACTION_ACL_DISCONNECT_REQUESTED)
+                addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
+            }
+            stateReceiverRegistered = register(stateReceiver, filter)
         }
 
         override fun onCancel(o: Any?) {
             statusSink = null
-            context!!.unregisterReceiver(mReceiver)
+            unregisterStateReceiver()
         }
     }
 
     private val readResultsHandler: StreamHandler = object : StreamHandler {
-        override fun onListen(o: Any?, eventSink: EventSink) {
-            readSink = eventSink
-        }
+        override fun onListen(o: Any?, eventSink: EventSink) { readSink = eventSink }
+        override fun onCancel(o: Any?) { readSink = null }
+    }
 
-        override fun onCancel(o: Any?) {
-            readSink = null
+    private val scanReceiver: BroadcastReceiver = object : BroadcastReceiver() {
+        @SuppressLint("MissingPermission")
+        override fun onReceive(context: Context, intent: Intent) {
+            try {
+                if (BluetoothDevice.ACTION_FOUND != intent.action) return
+                @Suppress("DEPRECATION")
+                val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE) ?: return
+                if (!isPrinter(device)) return
+                val ret: MutableMap<String, Any> = HashMap()
+                ret["address"] = device.address
+                ret["name"] = (if (hasConnectPermission()) device.name else null) ?: "Unknown"
+                ret["type"] = device.type
+                scanSink?.success(ret)
+            } catch (e: Exception) {
+                Log.e(TAG, "scan receiver error", e)
+            }
         }
     }
 
-    private fun pairDevice(result: Result, address: String) {
-        try {
-            val device = mBluetoothAdapter!!.getRemoteDevice(address)
-            if (device != null) {
-                if (device.bondState == BluetoothDevice.BOND_BONDED) {
-                    result.success(true)
-                    return
-                }
-                device.createBond()
-                result.success(true) 
-            } else {
-                 result.error("error", "device not found", null)
-            }
-        } catch (ex: Exception) {
-            result.error("error", ex.message, null)
+    @SuppressLint("MissingPermission")
+    private fun stopScan() {
+        if (scanReceiverRegistered) {
+            scanReceiverRegistered = false
+            unregister(scanReceiver)
         }
+        try { if (hasScanPermission()) mBluetoothAdapter?.cancelDiscovery() } catch (e: Exception) { Log.w(TAG, "cancelDiscovery: ${e.message}") }
     }
 
     private val scanStreamHandler: StreamHandler = object : StreamHandler {
-        private val scanReceiver: BroadcastReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context, intent: Intent) {
-                val action = intent.action
-                if (BluetoothDevice.ACTION_FOUND == action) {
-                    val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
-                    if (device != null && isPrinter(device)) {
-                        val ret: MutableMap<String, Any> = HashMap()
-                        ret["address"] = device.address
-                        ret["name"] = device.name ?: "Unknown"
-                        ret["type"] = device.type
-                        scanSink?.success(ret)
-                    }
-                }
-            }
-        }
-
+        @SuppressLint("MissingPermission")
         override fun onListen(o: Any?, eventSink: EventSink) {
+            val adapter = mBluetoothAdapter
+            if (adapter == null) {
+                eventSink.error("bluetooth_unavailable", "the device does not have bluetooth", null)
+                return
+            }
+            if (!hasScanPermission()) {
+                eventSink.error("no_permissions", "BLUETOOTH_SCAN / location permission missing", null)
+                return
+            }
             scanSink = eventSink
-            val filter = IntentFilter()
-            filter.addAction(BluetoothDevice.ACTION_FOUND)
-            context?.registerReceiver(scanReceiver, filter)
-            mBluetoothAdapter?.startDiscovery()
+            if (!scanReceiverRegistered) {
+                scanReceiverRegistered = register(scanReceiver, IntentFilter(BluetoothDevice.ACTION_FOUND))
+            }
+            try {
+                if (adapter.isDiscovering) adapter.cancelDiscovery()
+                adapter.startDiscovery()
+            } catch (e: Exception) {
+                Log.e(TAG, "startDiscovery failed", e)
+                eventSink.error("scan_error", e.message, null)
+            }
         }
 
         override fun onCancel(o: Any?) {
             scanSink = null
-            try {
-               context?.unregisterReceiver(scanReceiver)
-               mBluetoothAdapter?.cancelDiscovery()
-            } catch (e: Exception) {
-               Log.e(TAG, "Error unregistering scan receiver", e)
-            }
+            stopScan()
         }
     }
 }

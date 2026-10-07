@@ -131,64 +131,68 @@ class DragoBluePrinter {
 
   Future<bool?> get isOn async => await _channel.invokeMethod('isOn');
 
-  Future<bool?> get isConnected async =>
-      await _channel.invokeMethod('isConnected');
+  Future<bool?> get isConnected async {
+    try {
+      return await _channel.invokeMethod<bool>('isConnected');
+    } catch (e) {
+      return false;
+    }
+  }
 
   Future<bool?> openSettings() async =>
       await _channel.invokeMethod('openSettings');
 
+  /// Requests the runtime Bluetooth permissions. On Android 12+ only
+  /// BLUETOOTH_SCAN + BLUETOOTH_CONNECT matter (the legacy
+  /// [Permission.bluetooth] can report denied there); below 12
+  /// permission_handler reports those two as granted.
+  Future<bool> _ensurePermissions({bool location = false}) async {
+    try {
+      final perms = <Permission>[
+        Permission.bluetoothScan,
+        Permission.bluetoothConnect,
+        if (location) Permission.location,
+      ];
+      final statuses = await perms.request();
+      final granted = statuses[Permission.bluetoothScan]?.isGranted == true &&
+          statuses[Permission.bluetoothConnect]?.isGranted == true;
+      if (!granted &&
+          statuses.values.any((s) => s.isPermanentlyDenied)) {
+        await openAppSettings();
+      }
+      return granted;
+    } catch (e) {
+      // Permission plugin unavailable / already requesting: let the native
+      // side decide (it checks and reports no_permissions).
+      return true;
+    }
+  }
+
   ///getBondedDevices()
   Future<List<BluetoothDevice>> getBondedDevices() async {
-    Map<Permission, PermissionStatus> statuses = await [
-      Permission.bluetooth,
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-    ].request();
-
-    bool allGranted = statuses[Permission.bluetooth]!.isGranted &&
-        statuses[Permission.bluetoothScan]!.isGranted &&
-        statuses[Permission.bluetoothConnect]!.isGranted;
-
-    if (allGranted) {
-      try {
-        final List list = await (_channel.invokeMethod('getBondedDevices'));
-        return list.map((map) => BluetoothDevice.fromMap(map)).toList();
-      } catch (e) {
-        print("Error getting bonded devices: $e");
-        return [];
-      }
-    } else {
-      bool anyPermanentlyDenied =
-          statuses.values.any((s) => s.isPermanentlyDenied);
-      if (anyPermanentlyDenied) {
-        openAppSettings();
-      }
+    if (!await _ensurePermissions()) return [];
+    try {
+      final List? list = await _channel.invokeMethod<List>('getBondedDevices');
+      return (list ?? const [])
+          .whereType<Map>()
+          .map((map) => BluetoothDevice.fromMap(map))
+          .toList();
+    } catch (e) {
+      print("Error getting bonded devices: $e");
       return [];
     }
   }
 
   ///scan()
   Stream<BluetoothDevice> scan() async* {
-    Map<Permission, PermissionStatus> statuses = await [
-      Permission.bluetooth,
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.location,
-    ].request();
-
-    bool allGranted = statuses[Permission.bluetooth]!.isGranted &&
-        statuses[Permission.bluetoothScan]!.isGranted &&
-        statuses[Permission.bluetoothConnect]!.isGranted;
-    // Location might be denied on Android 12+ if strictly using scan for connect,
-    // but for discovery, it's safer to have it or ignore if API>=31.
-    // We will proceed if bluetooth perms are granted.
-
-    // Simplification: Proceed if core bluetooth perms are there.
-    if (allGranted) {
-      yield* _scanChannel
-          .receiveBroadcastStream()
-          .map((map) => BluetoothDevice.fromMap(map));
-    }
+    // Location is needed for discovery below Android 12; native reports
+    // no_permissions if it is missing, which ends the scan quietly here.
+    if (!await _ensurePermissions(location: true)) return;
+    yield* _scanChannel
+        .receiveBroadcastStream()
+        .where((map) => map is Map)
+        .map((map) => BluetoothDevice.fromMap(map as Map))
+        .handleError((Object e) => print("Bluetooth scan error: $e"));
   }
 
   ///pairDevice(BluetoothDevice device)
@@ -198,6 +202,20 @@ class DragoBluePrinter {
   ///isDeviceConnected(BluetoothDevice device)
   Future<bool?> isDeviceConnected(BluetoothDevice device) async =>
       await _channel.invokeMethod('isDeviceConnected', device.toMap());
+
+  /// Writes [query] on the open connection and returns the printer's first
+  /// reply within [timeout], or null when not connected / no reply.
+  Future<Uint8List?> queryStatus(
+    Uint8List query, {
+    Duration timeout = const Duration(milliseconds: 1500),
+  }) =>
+      _channel.invokeMethod<Uint8List>('queryStatus', {
+        'query': query,
+        'timeout': timeout.inMilliseconds,
+      }).catchError((Object e) {
+        print("queryStatus failed: $e");
+        return null;
+      });
 
   ///connect(BluetoothDevice device)
   Future<dynamic> connect(BluetoothDevice device) async =>
@@ -308,11 +326,16 @@ class BluetoothDevice {
   final int type = 0;
   bool connected = false;
 
+  /// Battery % when the printer reports it to the phone, else null.
+  int? battery;
+
   BluetoothDevice(this.name, this.address);
 
   BluetoothDevice.fromMap(Map map)
       : name = map['name'],
-        address = map['address'];
+        address = map['address'],
+        connected = map['connected'] == true,
+        battery = map['battery'] is int ? map['battery'] as int : null;
 
   Map<String, dynamic> toMap() => {
         'name': this.name,
