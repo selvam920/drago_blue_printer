@@ -46,6 +46,7 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
     companion object {
         private const val TAG = "BThermalPrinterPlugin"
         private const val NAMESPACE = "drago_blue_printer"
+        private const val MAX_IMAGE_SIDE = 2048
         private val MY_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
         // Shared across engines; always read/written under [threadLock].
@@ -246,12 +247,12 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
             "printImage" -> {
                 val path = str("pathImage")
                 if (path == null) result.error("invalid_argument", "argument 'pathImage' not found", null)
-                else send(result) { imageBytes(BitmapFactory.decodeFile(path)) }
+                else send(result) { imageBytes(decodeCapped { BitmapFactory.decodeFile(path, it) }) }
             }
             "printImageBytes" -> {
                 val bytes = arguments?.get("bytes") as? ByteArray
                 if (bytes == null) result.error("invalid_argument", "argument 'bytes' not found", null)
-                else send(result) { imageBytes(BitmapFactory.decodeByteArray(bytes, 0, bytes.size)) }
+                else send(result) { imageBytes(decodeCapped { BitmapFactory.decodeByteArray(bytes, 0, bytes.size, it) }) }
             }
             "printLeftRight" -> {
                 val s1 = str("string1"); val s2 = str("string2")
@@ -497,6 +498,16 @@ class DragoBluePrinterPlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
 
     private fun columnBytes(size: Int, charset: String?, format: String, vararg cols: String): ByteArray =
         sizeCmd(size) + PrinterCommands.ESC_ALIGN_CENTER + encode(String.format(format, *cols), charset)
+
+    // Printers print at most ~576 dots wide, so anything past MAX_IMAGE_SIDE is
+    // halved (inSampleSize) while decoding instead of loading the full image.
+    private fun decodeCapped(decode: (BitmapFactory.Options) -> android.graphics.Bitmap?): android.graphics.Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        decode(bounds)
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > MAX_IMAGE_SIDE) sample *= 2
+        return decode(BitmapFactory.Options().apply { inSampleSize = sample })
+    }
 
     private fun imageBytes(bmp: android.graphics.Bitmap?): ByteArray? {
         if (bmp == null) {

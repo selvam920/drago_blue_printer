@@ -1,3 +1,6 @@
+## 1.0.5
+* Android: `printImage` / `printImageBytes` decode with `BitmapFactory.Options` and downsample (`inSampleSize`) images past 2048 px, so an oversized image cannot exhaust memory (Play Console bitmap check).
+
 ## 1.0.4
 * Fix app crash when the printer closes the link (reader thread threw on read -1).
 * Fix crashes from null adapter/context/binding and bad argument types; every call now replies once, on the main thread.
